@@ -4,3 +4,7 @@ psycopg[binary]==3.2.9
 cryptography==45.0.6
 PyJWT[crypto]==2.10.1
 pydantic==2.11.7
+boto3>=1.35,<2
+google-cloud-kms>=3,<4
+hvac>=2.3,<3
+pytest>=8,<9
