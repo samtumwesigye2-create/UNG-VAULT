@@ -24,6 +24,74 @@ def test_provider_factory_rejects_unknown_backend(monkeypatch):
         get_key_provider()
 
 
+def test_aws_kms_provider_preserves_aad_context():
+    from app.key_management import AwsKmsKeyProvider, WrappedKey
+
+    class Client:
+        def encrypt(self, **kwargs):
+            assert kwargs["KeyId"] == "arn:aws:kms:us-east-1:1:key/test"
+            assert kwargs["EncryptionContext"]["aad_sha256"]
+            return {"CiphertextBlob": b"aws-wrapped"}
+
+        def decrypt(self, **kwargs):
+            assert kwargs["CiphertextBlob"] == b"aws-wrapped"
+            assert kwargs["EncryptionContext"]["aad_sha256"]
+            return {"Plaintext": b"d" * 32}
+
+    provider = AwsKmsKeyProvider("arn:aws:kms:us-east-1:1:key/test", client=Client())
+    wrapped = provider.wrap_key(b"d" * 32, b"shipment:42")
+    assert wrapped == WrappedKey("aws-kms", provider.key_id, b"aws-wrapped")
+    assert provider.unwrap_key(wrapped, b"shipment:42") == b"d" * 32
+
+
+def test_gcp_kms_provider_preserves_aad():
+    from app.key_management import GcpKmsKeyProvider
+
+    class Response:
+        ciphertext = b"gcp-wrapped"
+        plaintext = b"d" * 32
+
+    class Client:
+        def encrypt(self, request):
+            assert request["additional_authenticated_data"] == b"shipment:42"
+            return Response()
+
+        def decrypt(self, request):
+            assert request["additional_authenticated_data"] == b"shipment:42"
+            return Response()
+
+    provider = GcpKmsKeyProvider("projects/p/locations/l/keyRings/r/cryptoKeys/k", client=Client())
+    wrapped = provider.wrap_key(b"d" * 32, b"shipment:42")
+    assert wrapped.provider == "gcp-kms"
+    assert provider.unwrap_key(wrapped, b"shipment:42") == b"d" * 32
+
+
+def test_hashicorp_vault_transit_provider_round_trip_contract():
+    from app.key_management import HashicorpVaultTransitKeyProvider
+
+    class Transit:
+        def encrypt_data(self, **kwargs):
+            assert kwargs["context"] == base64.b64encode(b"shipment:42").decode()
+            return {"data": {"ciphertext": "vault:v1:wrapped"}}
+
+        def decrypt_data(self, **kwargs):
+            assert kwargs["ciphertext"] == "vault:v1:wrapped"
+            return {"data": {"plaintext": base64.b64encode(b"d" * 32).decode()}}
+
+    class Secrets:
+        transit = Transit()
+
+    class Client:
+        secrets = Secrets()
+
+    provider = HashicorpVaultTransitKeyProvider(
+        "ung-vault-dek", "https://vault.example", "token", client=Client()
+    )
+    wrapped = provider.wrap_key(b"d" * 32, b"shipment:42")
+    assert wrapped.provider == "hashicorp-vault"
+    assert provider.unwrap_key(wrapped, b"shipment:42") == b"d" * 32
+
+
 def test_crypto_uses_provider_envelope_v2(monkeypatch):
     from app import crypto
     from app.key_management import WrappedKey
@@ -40,7 +108,7 @@ def test_crypto_uses_provider_envelope_v2(monkeypatch):
             assert wrapped.key_id == self.key_id
             return wrapped.ciphertext.removeprefix(b"wrapped:")
 
-    monkeypatch.setattr(crypto, "get_key_provider", lambda: FakeProvider())
+    monkeypatch.setattr(crypto, "get_key_provider", lambda *args, **kwargs: FakeProvider())
 
     envelope = crypto.encrypt_bytes(b"secret payload", b"shipment:42")
 
