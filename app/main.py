@@ -83,3 +83,10 @@ def audit_verify(p: Principal = Depends(require_principal)):
             result = verify_chain(cur)
             append_audit(cur, p.subject, "audit_verified", detail=result)
             return result
+
+import os
+from pathlib import Path
+from urllib.parse import urlsplit
+from ui_portal import install_ui
+_janus = urlsplit(os.getenv('JANUS_INTROSPECT_URL', 'https://ung-iam-production.up.railway.app/v1/auth/introspect'))
+install_ui(app, Path(__file__).resolve().parent.parent / 'ui' / 'index.html', f'{_janus.scheme}://{_janus.netloc}')
