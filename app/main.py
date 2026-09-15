@@ -1,5 +1,8 @@
-import json, uuid
-from fastapi import Depends, FastAPI, HTTPException
+import json, uuid, os
+from pathlib import Path
+from urllib.parse import urlsplit, quote
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from .auth import Principal, authorize, require_principal
 from .audit import append_audit, verify_chain
@@ -7,7 +10,7 @@ from .crypto import decrypt_bytes, encrypt_bytes
 from .db import connect, init_db
 from .config import load_settings
 
-app = FastAPI(title="UNG-VAULT", version="1.0.0")
+app = FastAPI(title="UNG-VAULT", version="1.1.0")
 
 class StoreRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -22,7 +25,7 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"status":"ok","service":"UNG-VAULT","version":"1.0.0"}
+    return {"status":"ok","service":"UNG-VAULT","version":"1.1.0"}
 
 @app.get("/ready")
 def ready():
@@ -74,6 +77,50 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
             append_audit(cur, p.subject, "object_read", object_id)
             return {"id":str(row["id"]),"name":row["name"],"compartment":row["compartment"],"classification":row["classification"],"value":value}
 
+MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
+FILE_MAGIC = b"UNGVAULT1\n"
+
+def _safe_name(name: str) -> str:
+    return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
+
+@app.post("/vault/files/encrypt")
+async def encrypt_file(file: UploadFile = File(...), p: Principal = Depends(require_principal)):
+    data = await file.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
+    file_id = str(uuid.uuid4())
+    name = _safe_name(file.filename)
+    envelope = encrypt_bytes(data, file_id.encode())
+    package = {"format":"UNG-VAULT-FILE","version":1,"id":file_id,"filename":name,"envelope":envelope}
+    payload = FILE_MAGIC + json.dumps(package, separators=(",", ":")).encode()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            append_audit(cur, p.subject, "file_encrypted", file_id, {"filename":name,"bytes":len(data)})
+    out = name + ".ungvault"
+    return Response(payload, media_type="application/octet-stream", headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(out)}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+
+@app.post("/vault/files/decrypt")
+async def decrypt_file(file: UploadFile = File(...), p: Principal = Depends(require_principal)):
+    raw = await file.read(MAX_FILE_BYTES + 1024 * 1024)
+    if not raw.startswith(FILE_MAGIC):
+        raise HTTPException(400, "Not a UNG-VAULT encrypted file")
+    try:
+        package = json.loads(raw[len(FILE_MAGIC):])
+        if package.get("format") != "UNG-VAULT-FILE" or package.get("version") != 1:
+            raise ValueError()
+        file_id = str(package["id"])
+        name = _safe_name(package["filename"])
+        data = decrypt_bytes(package["envelope"], file_id.encode())
+    except Exception:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                append_audit(cur, p.subject, "file_decryption_failed")
+        raise HTTPException(409, "Encrypted file integrity verification failed")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            append_audit(cur, p.subject, "file_decrypted", file_id, {"filename":name,"bytes":len(data)})
+    return Response(data, media_type="application/octet-stream", headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name)}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+
 @app.get("/audit/verify")
 def audit_verify(p: Principal = Depends(require_principal)):
     if p.clearance not in {"restricted","top_secret"}:
@@ -84,9 +131,6 @@ def audit_verify(p: Principal = Depends(require_principal)):
             append_audit(cur, p.subject, "audit_verified", detail=result)
             return result
 
-import os
-from pathlib import Path
-from urllib.parse import urlsplit
 from ui_portal import install_ui
 _janus = urlsplit(os.getenv('JANUS_INTROSPECT_URL', 'https://ung-iam-production.up.railway.app/v1/auth/introspect'))
 install_ui(app, Path(__file__).resolve().parent.parent / 'ui' / 'index.html', f'{_janus.scheme}://{_janus.netloc}')
