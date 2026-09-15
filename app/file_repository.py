@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 
@@ -14,43 +13,39 @@ class VaultFileRepository:
         envelope = dict(record["envelope"])
         envelope.pop("ciphertext", None)
         params = (
-            record["id"],
-            record["compartment"],
-            record["classification"],
-            record["name"],
-            record.get("content_type"),
-            record["storage_key"],
-            record["ciphertext_sha256"],
-            record["plaintext_sha256"],
-            record["size_bytes"],
-            record["key_version"],
-            envelope,
+            record["id"], record["compartment"], record["classification"],
+            record["name"], record.get("content_type"), record["storage_key"],
+            record["ciphertext_sha256"], record["plaintext_sha256"],
+            record["size_bytes"], record["key_version"], envelope,
             record["created_by"],
         )
         with self.connection.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO vault_files (
+                """INSERT INTO vault_files (
                     id, compartment, classification, name, content_type,
                     storage_key, ciphertext_sha256, plaintext_sha256,
                     size_bytes, key_version, envelope, created_by
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                )
-                """,
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 params,
             )
 
     def get(self, file_id: str):
         with self.connection.cursor() as cur:
             cur.execute(
-                """
-                SELECT id, compartment, classification, name, content_type,
-                       storage_key, ciphertext_sha256, plaintext_sha256,
-                       size_bytes, key_version, envelope, created_by, created_at
-                FROM vault_files
-                WHERE id = %s
-                """,
-                (file_id,),
+                """SELECT id, compartment, classification, name, content_type,
+                          storage_key, ciphertext_sha256, plaintext_sha256,
+                          size_bytes, key_version, envelope, created_by, created_at
+                   FROM vault_files WHERE id = %s""", (file_id,)
             )
             return cur.fetchone()
+
+    def list_for_owner(self, created_by: str):
+        with self.connection.cursor() as cur:
+            cur.execute(
+                """SELECT id, compartment, classification, name, content_type,
+                          size_bytes, key_version, created_by, created_at
+                   FROM vault_files
+                   WHERE created_by = %s
+                   ORDER BY created_at DESC""", (created_by,)
+            )
+            return cur.fetchall()
