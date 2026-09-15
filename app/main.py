@@ -1,4 +1,5 @@
 import json, uuid, os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
@@ -9,14 +10,24 @@ from .audit import append_audit, verify_chain
 from .crypto import decrypt_bytes, encrypt_bytes
 from .db import connect, init_db
 from .config import load_settings
+from .share_repository import VaultShareRepository
+from .sharing import ShareAccessError, ShareService
 
-app = FastAPI(title="UNG-VAULT", version="1.1.0")
+app = FastAPI(title="UNG-VAULT", version="1.2.0")
 
 class StoreRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     compartment: str = Field(min_length=1, max_length=100)
     classification: str
     value: str
+
+class CreateShareRequest(BaseModel):
+    file_id: str = Field(min_length=1)
+    access_code: str = Field(min_length=8, max_length=256)
+    expires_minutes: int = Field(default=60, ge=1, le=10080)
+
+class OpenShareRequest(BaseModel):
+    access_code: str = Field(min_length=1, max_length=256)
 
 @app.on_event("startup")
 def startup():
@@ -25,7 +36,7 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"status":"ok","service":"UNG-VAULT","version":"1.1.0"}
+    return {"status":"ok","service":"UNG-VAULT","version":"1.2.0"}
 
 @app.get("/ready")
 def ready():
@@ -120,6 +131,60 @@ async def decrypt_file(file: UploadFile = File(...), p: Principal = Depends(requ
         with conn.cursor() as cur:
             append_audit(cur, p.subject, "file_decrypted", file_id, {"filename":name,"bytes":len(data)})
     return Response(data, media_type="application/octet-stream", headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name)}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+
+@app.post("/vault/shares")
+def create_share(req: CreateShareRequest, p: Principal = Depends(require_principal)):
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=req.expires_minutes)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,created_by FROM vault_files WHERE id=%s", (req.file_id,))
+            file_row = cur.fetchone()
+            if not file_row:
+                raise HTTPException(404, "File not found")
+            if file_row["created_by"] != p.subject:
+                append_audit(cur, p.subject, "denied_share_create", req.file_id)
+                raise HTTPException(403, "Only the file owner can create this share")
+        share = ShareService().create_level1(file_id=req.file_id, file_key=os.urandom(32), access_code=req.access_code, expires_at=expires_at)
+        share["created_by"] = p.subject
+        VaultShareRepository(conn).create(share)
+        with conn.cursor() as cur:
+            append_audit(cur, p.subject, "share_created", req.file_id, {"share_id":share["id"],"security_level":1,"expires_at":expires_at.isoformat()})
+    return {"id":share["id"],"file_id":req.file_id,"security_level":1,"expires_at":expires_at}
+
+@app.post("/vault/shares/{share_id}/open")
+def open_share(share_id: str, req: OpenShareRequest):
+    with connect() as conn:
+        repo = VaultShareRepository(conn)
+        share = repo.get(share_id)
+        if not share:
+            raise HTTPException(404, "Share not found")
+        try:
+            ShareService().unlock(share, req.access_code)
+        except ShareAccessError:
+            with conn.cursor() as cur:
+                append_audit(cur, "shared-access", "share_access_denied", str(share["file_id"]), {"share_id":share_id})
+            raise HTTPException(403, "Invalid, expired, or revoked share")
+        with conn.cursor() as cur:
+            append_audit(cur, "shared-access", "share_access_granted", str(share["file_id"]), {"share_id":share_id})
+    return {"share_id":share_id,"file_id":str(share["file_id"]),"authorized":True}
+
+@app.post("/vault/shares/{share_id}/revoke")
+def revoke_share(share_id: str, p: Principal = Depends(require_principal)):
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        repo = VaultShareRepository(conn)
+        share = repo.get(share_id)
+        if not share:
+            raise HTTPException(404, "Share not found")
+        if share["created_by"] != p.subject:
+            with conn.cursor() as cur:
+                append_audit(cur, p.subject, "denied_share_revoke", str(share["file_id"]), {"share_id":share_id})
+            raise HTTPException(403, "Only the share creator can revoke this share")
+        repo.revoke(share_id, now)
+        with conn.cursor() as cur:
+            append_audit(cur, p.subject, "share_revoked", str(share["file_id"]), {"share_id":share_id})
+    return {"id":share_id,"revoked":True,"revoked_at":now}
 
 @app.get("/audit/verify")
 def audit_verify(p: Principal = Depends(require_principal)):
