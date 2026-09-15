@@ -16,7 +16,7 @@ class StoredFileService:
     """Encrypts before persistence and decrypts only after verified retrieval."""
 
     def __init__(self, store: LocalCiphertextStore, crypto: FileCrypto):
-        self.store = store
+        self.ciphertext_store = store
         self.crypto = crypto
 
     @staticmethod
@@ -33,7 +33,7 @@ class StoredFileService:
             raise ValueError("crypto envelope missing ciphertext")
         ciphertext = base64.b64decode(encoded, validate=True)
         storage_key = f"files/{file_id}.bin"
-        ciphertext_sha256 = self.store.put(storage_key, ciphertext)
+        ciphertext_sha256 = self.ciphertext_store.put(storage_key, ciphertext)
         return {
             "id": file_id,
             "storage_key": storage_key,
@@ -47,7 +47,7 @@ class StoredFileService:
     def retrieve(self, file_id: str, record: dict) -> bytes:
         if record.get("id") != file_id:
             raise ValueError("file metadata does not match requested id")
-        ciphertext = self.store.get(
+        ciphertext = self.ciphertext_store.get(
             record["storage_key"], expected_sha256=record["ciphertext_sha256"]
         )
         envelope = dict(record["envelope"])
