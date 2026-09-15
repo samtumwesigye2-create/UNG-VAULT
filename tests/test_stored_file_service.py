@@ -7,13 +7,15 @@ from app.stored_files import StoredFileService
 
 
 class FakeCrypto:
+    """Reversible test transform whose output does not contain plaintext bytes."""
+
     def encrypt(self, plaintext: bytes, aad: bytes) -> dict:
-        return {"v": 99, "ciphertext": base64.b64encode(b"ENC:" + plaintext).decode()}
+        transformed = bytes(byte ^ 0xA5 for byte in plaintext)
+        return {"v": 99, "ciphertext": base64.b64encode(transformed).decode()}
 
     def decrypt(self, envelope: dict, aad: bytes) -> bytes:
-        raw = base64.b64decode(envelope["ciphertext"])
-        assert raw.startswith(b"ENC:")
-        return raw[4:]
+        transformed = base64.b64decode(envelope["ciphertext"])
+        return bytes(byte ^ 0xA5 for byte in transformed)
 
 
 def test_store_persists_ciphertext_not_plaintext(tmp_path: Path):
