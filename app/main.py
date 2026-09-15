@@ -16,178 +16,148 @@ from .stored_files import EnvelopeCryptoAdapter, StoredFileService
 from .share_repository import VaultShareRepository
 from .sharing import ShareAccessError, ShareService
 
-app = FastAPI(title="UNG-VAULT", version="1.3.0")
+app = FastAPI(title="UNG-VAULT", version="1.4.0")
 
 class StoreRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
-    compartment: str = Field(min_length=1, max_length=100)
-    classification: str
-    value: str
-
+    name: str = Field(min_length=1, max_length=200); compartment: str = Field(min_length=1, max_length=100); classification: str; value: str
 class CreateShareRequest(BaseModel):
-    file_id: str = Field(min_length=1)
-    access_code: str = Field(min_length=8, max_length=256)
-    expires_minutes: int = Field(default=60, ge=1, le=10080)
+    file_id: str = Field(min_length=1); access_code: str = Field(min_length=8, max_length=256); expires_minutes: int = Field(default=60, ge=1, le=10080)
+class OpenShareRequest(BaseModel): access_code: str = Field(min_length=1, max_length=256)
 
-class OpenShareRequest(BaseModel):
-    access_code: str = Field(min_length=1, max_length=256)
+def require_admin(p:Principal=Depends(require_principal)):
+    roles={str(x).lower() for x in (p.claims.get("roles") or [])}
+    if p.clearance!="top_secret" and not roles.intersection({"platform-admin","security-admin"}): raise HTTPException(403,"VAULT administrator access required")
+    return p
 
 @app.on_event("startup")
-def startup():
-    load_settings(); init_db()
-
+def startup(): load_settings(); init_db()
 @app.get("/health")
-def health(): return {"status":"ok","service":"UNG-VAULT","version":"1.3.0"}
-
+def health(): return {"status":"ok","service":"UNG-VAULT","version":"1.4.0"}
 @app.get("/ready")
 def ready():
     try:
         load_settings()
         with connect() as conn:
             with conn.cursor() as cur: cur.execute("SELECT 1"); cur.fetchone()
-        return {"ready": True}
-    except Exception as e: raise HTTPException(503, f"not ready: {type(e).__name__}")
+        return {"ready":True}
+    except Exception as e: raise HTTPException(503,f"not ready: {type(e).__name__}")
 
 @app.post("/vault/objects")
-def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
-    try: authorize(p, req.classification, req.compartment)
-    except HTTPException:
-        with connect() as conn:
-            with conn.cursor() as cur: append_audit(cur,p.subject,"denied_create",detail={"classification":req.classification,"compartment":req.compartment})
-        raise
-    object_id=str(uuid.uuid4()); envelope=encrypt_bytes(req.value.encode(),object_id.encode())
+def create_object(req:StoreRequest,p:Principal=Depends(require_principal)):
+    authorize(p,req.classification,req.compartment); oid=str(uuid.uuid4()); env=encrypt_bytes(req.value.encode(),oid.encode())
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO vault_objects(id,compartment,classification,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s::jsonb,%s)",(object_id,req.compartment,req.classification,req.name,json.dumps(envelope),p.subject))
-            append_audit(cur,p.subject,"object_created",object_id,{"classification":req.classification,"compartment":req.compartment})
-    return {"id":object_id,"name":req.name}
-
+            cur.execute("INSERT INTO vault_objects(id,compartment,classification,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s::jsonb,%s)",(oid,req.compartment,req.classification,req.name,json.dumps(env),p.subject)); append_audit(cur,p.subject,"object_created",oid)
+    return {"id":oid,"name":req.name}
 @app.get("/vault/objects/{object_id}")
 def get_object(object_id:str,p:Principal=Depends(require_principal)):
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id,name,compartment,classification,envelope FROM vault_objects WHERE id=%s",(object_id,)); row=cur.fetchone()
             if not row: raise HTTPException(404,"Object not found")
-            try: authorize(p,row["classification"],row["compartment"])
-            except HTTPException:
-                append_audit(cur,p.subject,"denied_read",object_id); raise
+            authorize(p,row["classification"],row["compartment"])
             try: value=decrypt_bytes(row["envelope"],object_id.encode()).decode()
-            except Exception:
-                append_audit(cur,p.subject,"decryption_failed",object_id); raise HTTPException(409,"Ciphertext integrity verification failed")
-            append_audit(cur,p.subject,"object_read",object_id)
-            return {"id":str(row["id"]),"name":row["name"],"compartment":row["compartment"],"classification":row["classification"],"value":value}
+            except Exception: append_audit(cur,p.subject,"decryption_failed",object_id); raise HTTPException(409,"Ciphertext integrity verification failed")
+            append_audit(cur,p.subject,"object_read",object_id); return {"id":str(row["id"]),"name":row["name"],"compartment":row["compartment"],"classification":row["classification"],"value":value}
 
-MAX_FILE_BYTES=int(os.getenv("VAULT_MAX_FILE_BYTES",str(25*1024*1024)))
-FILE_MAGIC=b"UNGVAULT1\n"
-
+MAX_FILE_BYTES=int(os.getenv("VAULT_MAX_FILE_BYTES",str(25*1024*1024))); FILE_MAGIC=b"UNGVAULT1\n"
 def _safe_name(name:str)->str: return Path(name or "file").name.replace("\r","_").replace("\n","_")[:180] or "file"
-def _stored_service()->StoredFileService:
-    root=os.getenv("VAULT_STORAGE_PATH","/tmp/ung-vault-ciphertext")
-    return StoredFileService(LocalCiphertextStore(root),EnvelopeCryptoAdapter())
+def _stored_service(): return StoredFileService(LocalCiphertextStore(os.getenv("VAULT_STORAGE_PATH","/tmp/ung-vault-ciphertext")),EnvelopeCryptoAdapter())
 
 @app.post("/vault/files")
 async def store_vault_file(file:UploadFile=File(...),compartment:str=Form(...),classification:str=Form(...),p:Principal=Depends(require_principal)):
-    authorize(p,classification,compartment)
-    data=await file.read(MAX_FILE_BYTES+1)
-    if len(data)>MAX_FILE_BYTES: raise HTTPException(413,f"File exceeds {MAX_FILE_BYTES//(1024*1024)} MB limit")
-    file_id=str(uuid.uuid4()); name=_safe_name(file.filename)
-    record=_stored_service().store(file_id,data)
-    record.update({"compartment":compartment,"classification":classification,"name":name,"content_type":file.content_type,"created_by":p.subject})
+    authorize(p,classification,compartment); data=await file.read(MAX_FILE_BYTES+1)
+    if len(data)>MAX_FILE_BYTES: raise HTTPException(413,"File too large")
+    fid=str(uuid.uuid4()); name=_safe_name(file.filename); record=_stored_service().store(fid,data); record.update({"compartment":compartment,"classification":classification,"name":name,"content_type":file.content_type,"created_by":p.subject})
     try:
         with connect() as conn:
             VaultFileRepository(conn).create(record)
-            with conn.cursor() as cur: append_audit(cur,p.subject,"stored_file_created",file_id,{"classification":classification,"compartment":compartment,"bytes":len(data)})
-    except Exception:
-        _stored_service().ciphertext_store.delete(record["storage_key"]); raise
-    return {"id":file_id,"name":name,"classification":classification,"compartment":compartment,"size_bytes":len(data)}
-
+            with conn.cursor() as cur: append_audit(cur,p.subject,"stored_file_created",fid,{"bytes":len(data)})
+    except Exception: _stored_service().ciphertext_store.delete(record["storage_key"]); raise
+    return {"id":fid,"name":name,"classification":classification,"compartment":compartment,"size_bytes":len(data)}
 @app.get("/vault/files")
 def list_vault_files(p:Principal=Depends(require_principal)):
     with connect() as conn: rows=VaultFileRepository(conn).list_for_owner(p.subject)
     return [{**dict(r),"id":str(r["id"])} for r in rows]
-
 @app.get("/vault/files/{file_id}/download")
 def download_vault_file(file_id:str,p:Principal=Depends(require_principal)):
     with connect() as conn:
-        repo=VaultFileRepository(conn); row=repo.get(file_id)
+        row=VaultFileRepository(conn).get(file_id)
         if not row: raise HTTPException(404,"File not found")
         authorize(p,row["classification"],row["compartment"])
         if row["created_by"]!=p.subject: raise HTTPException(403,"File owner access required")
         try: data=_stored_service().retrieve(file_id,dict(row))
-        except (StorageIntegrityError,ValueError,KeyError):
-            with conn.cursor() as cur: append_audit(cur,p.subject,"stored_file_integrity_failed",file_id)
-            raise HTTPException(409,"Stored file integrity verification failed")
+        except (StorageIntegrityError,ValueError,KeyError): raise HTTPException(409,"Stored file integrity verification failed")
         with conn.cursor() as cur: append_audit(cur,p.subject,"stored_file_downloaded",file_id)
-    name=_safe_name(row["name"])
-    return Response(data,media_type=row.get("content_type") or "application/octet-stream",headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name)}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+    return Response(data,media_type=row.get("content_type") or "application/octet-stream",headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(_safe_name(row['name']))}","Cache-Control":"no-store"})
 
 @app.post("/vault/files/encrypt")
 async def encrypt_file(file:UploadFile=File(...),p:Principal=Depends(require_principal)):
     data=await file.read(MAX_FILE_BYTES+1)
-    if len(data)>MAX_FILE_BYTES: raise HTTPException(413,f"File exceeds {MAX_FILE_BYTES//(1024*1024)} MB limit")
-    file_id=str(uuid.uuid4()); name=_safe_name(file.filename); envelope=encrypt_bytes(data,file_id.encode())
-    payload=FILE_MAGIC+json.dumps({"format":"UNG-VAULT-FILE","version":1,"id":file_id,"filename":name,"envelope":envelope},separators=(",",":")).encode()
-    with connect() as conn:
-        with conn.cursor() as cur: append_audit(cur,p.subject,"file_encrypted",file_id,{"filename":name,"bytes":len(data)})
-    return Response(payload,media_type="application/octet-stream",headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name+'.ungvault')}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
-
+    if len(data)>MAX_FILE_BYTES: raise HTTPException(413,"File too large")
+    fid=str(uuid.uuid4()); name=_safe_name(file.filename); env=encrypt_bytes(data,fid.encode()); payload=FILE_MAGIC+json.dumps({"format":"UNG-VAULT-FILE","version":1,"id":fid,"filename":name,"envelope":env},separators=(",",":")).encode()
+    return Response(payload,media_type="application/octet-stream",headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name+'.ungvault')}"})
 @app.post("/vault/files/decrypt")
 async def decrypt_file(file:UploadFile=File(...),p:Principal=Depends(require_principal)):
     raw=await file.read(MAX_FILE_BYTES+1024*1024)
     if not raw.startswith(FILE_MAGIC): raise HTTPException(400,"Not a UNG-VAULT encrypted file")
     try:
-        package=json.loads(raw[len(FILE_MAGIC):]); file_id=str(package["id"]); name=_safe_name(package["filename"])
-        if package.get("format")!="UNG-VAULT-FILE" or package.get("version")!=1: raise ValueError()
-        data=decrypt_bytes(package["envelope"],file_id.encode())
-    except Exception:
-        with connect() as conn:
-            with conn.cursor() as cur: append_audit(cur,p.subject,"file_decryption_failed")
-        raise HTTPException(409,"Encrypted file integrity verification failed")
-    with connect() as conn:
-        with conn.cursor() as cur: append_audit(cur,p.subject,"file_decrypted",file_id,{"filename":name,"bytes":len(data)})
-    return Response(data,media_type="application/octet-stream",headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name)}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+        pkg=json.loads(raw[len(FILE_MAGIC):]); fid=str(pkg["id"]); name=_safe_name(pkg["filename"]); data=decrypt_bytes(pkg["envelope"],fid.encode())
+    except Exception: raise HTTPException(409,"Encrypted file integrity verification failed")
+    return Response(data,media_type="application/octet-stream",headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name)}"})
 
 @app.post("/vault/shares")
 def create_share(req:CreateShareRequest,p:Principal=Depends(require_principal)):
-    now=datetime.now(timezone.utc); expires_at=now+timedelta(minutes=req.expires_minutes)
+    exp=datetime.now(timezone.utc)+timedelta(minutes=req.expires_minutes)
     with connect() as conn:
-        file_row=VaultFileRepository(conn).get(req.file_id)
-        if not file_row: raise HTTPException(404,"File not found")
-        if file_row["created_by"]!=p.subject: raise HTTPException(403,"Only the file owner can create this share")
-        share=ShareService().create_level1(file_id=req.file_id,file_key=os.urandom(32),access_code=req.access_code,expires_at=expires_at); share["created_by"]=p.subject
-        VaultShareRepository(conn).create(share)
-        with conn.cursor() as cur: append_audit(cur,p.subject,"share_created",req.file_id,{"share_id":share["id"],"security_level":1})
-    return {"id":share["id"],"file_id":req.file_id,"security_level":1,"expires_at":expires_at}
-
+        f=VaultFileRepository(conn).get(req.file_id)
+        if not f: raise HTTPException(404,"File not found")
+        if f["created_by"]!=p.subject: raise HTTPException(403,"Only the file owner can create this share")
+        s=ShareService().create_level1(req.file_id,os.urandom(32),req.access_code,exp); s["created_by"]=p.subject; VaultShareRepository(conn).create(s)
+        with conn.cursor() as cur: append_audit(cur,p.subject,"share_created",req.file_id,{"share_id":s["id"]})
+    return {"id":s["id"],"file_id":req.file_id,"security_level":1,"expires_at":exp}
 @app.post("/vault/shares/{share_id}/open")
 def open_share(share_id:str,req:OpenShareRequest):
     with connect() as conn:
-        repo=VaultShareRepository(conn); share=repo.get(share_id)
-        if not share: raise HTTPException(404,"Share not found")
-        try: ShareService().unlock(share,req.access_code)
-        except ShareAccessError:
-            with conn.cursor() as cur: append_audit(cur,"shared-access","share_access_denied",str(share["file_id"]),{"share_id":share_id})
-            raise HTTPException(403,"Invalid, expired, or revoked share")
-        with conn.cursor() as cur: append_audit(cur,"shared-access","share_access_granted",str(share["file_id"]),{"share_id":share_id})
-    return {"share_id":share_id,"file_id":str(share["file_id"]),"authorized":True}
-
+        s=VaultShareRepository(conn).get(share_id)
+        if not s: raise HTTPException(404,"Share not found")
+        try: ShareService().unlock(s,req.access_code)
+        except ShareAccessError: raise HTTPException(403,"Invalid, expired, or revoked share")
+    return {"share_id":share_id,"file_id":str(s["file_id"]),"authorized":True}
 @app.post("/vault/shares/{share_id}/revoke")
 def revoke_share(share_id:str,p:Principal=Depends(require_principal)):
     now=datetime.now(timezone.utc)
     with connect() as conn:
-        repo=VaultShareRepository(conn); share=repo.get(share_id)
-        if not share: raise HTTPException(404,"Share not found")
-        if share["created_by"]!=p.subject: raise HTTPException(403,"Only the share creator can revoke this share")
+        repo=VaultShareRepository(conn); s=repo.get(share_id)
+        if not s: raise HTTPException(404,"Share not found")
+        if s["created_by"]!=p.subject: raise HTTPException(403,"Only the share creator can revoke this share")
         repo.revoke(share_id,now)
-        with conn.cursor() as cur: append_audit(cur,p.subject,"share_revoked",str(share["file_id"]),{"share_id":share_id})
     return {"id":share_id,"revoked":True,"revoked_at":now}
 
+@app.get("/admin/files")
+def admin_files(p:Principal=Depends(require_admin)):
+    with connect() as conn:
+        with conn.cursor() as cur: cur.execute("SELECT id,name,classification,compartment,size_bytes,created_by,created_at FROM vault_files ORDER BY created_at DESC LIMIT 500"); return [dict(x) for x in cur.fetchall()]
+@app.get("/admin/shares")
+def admin_shares(p:Principal=Depends(require_admin)):
+    with connect() as conn:
+        with conn.cursor() as cur: cur.execute("SELECT id,file_id,security_level,expires_at,revoked_at,created_by,created_at FROM vault_shares ORDER BY created_at DESC LIMIT 500"); return [dict(x) for x in cur.fetchall()]
+@app.post("/admin/shares/{share_id}/revoke")
+def admin_revoke_share(share_id:str,p:Principal=Depends(require_admin)):
+    now=datetime.now(timezone.utc)
+    with connect() as conn:
+        VaultShareRepository(conn).revoke(share_id,now)
+        with conn.cursor() as cur: append_audit(cur,p.subject,"admin_share_revoked",detail={"share_id":share_id})
+    return {"id":share_id,"revoked":True,"revoked_at":now}
+@app.get("/admin/audit")
+def admin_audit(p:Principal=Depends(require_admin)):
+    with connect() as conn:
+        with conn.cursor() as cur: cur.execute("SELECT seq,actor,action,object_id,detail,entry_hash FROM vault_audit ORDER BY seq DESC LIMIT 500"); return [dict(x) for x in cur.fetchall()]
 @app.get("/audit/verify")
 def audit_verify(p:Principal=Depends(require_principal)):
     if p.clearance not in {"restricted","top_secret"}: raise HTTPException(403,"Restricted clearance required")
     with connect() as conn:
-        with conn.cursor() as cur:
-            result=verify_chain(cur); append_audit(cur,p.subject,"audit_verified",detail=result); return result
+        with conn.cursor() as cur: result=verify_chain(cur); append_audit(cur,p.subject,"audit_verified",detail=result); return result
 
 from ui_portal import install_ui
 _janus=urlsplit(os.getenv('JANUS_INTROSPECT_URL','https://ung-iam-production.up.railway.app/v1/auth/introspect'))
