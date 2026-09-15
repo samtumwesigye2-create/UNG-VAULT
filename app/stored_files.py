@@ -4,12 +4,23 @@ import base64
 import hashlib
 from typing import Protocol
 
+from .crypto import decrypt_bytes, encrypt_bytes
 from .file_store import LocalCiphertextStore
 
 
 class FileCrypto(Protocol):
     def encrypt(self, plaintext: bytes, aad: bytes) -> dict: ...
     def decrypt(self, envelope: dict, aad: bytes) -> bytes: ...
+
+
+class EnvelopeCryptoAdapter:
+    """Adapts UNG-VAULT's KMS-backed envelope functions to stored-file service."""
+
+    def encrypt(self, plaintext: bytes, aad: bytes) -> dict:
+        return encrypt_bytes(plaintext, aad)
+
+    def decrypt(self, envelope: dict, aad: bytes) -> bytes:
+        return decrypt_bytes(envelope, aad)
 
 
 class StoredFileService:
@@ -45,14 +56,14 @@ class StoredFileService:
         }
 
     def retrieve(self, file_id: str, record: dict) -> bytes:
-        if record.get("id") != file_id:
+        if str(record.get("id")) != str(file_id):
             raise ValueError("file metadata does not match requested id")
         ciphertext = self.ciphertext_store.get(
             record["storage_key"], expected_sha256=record["ciphertext_sha256"]
         )
         envelope = dict(record["envelope"])
         envelope["ciphertext"] = base64.b64encode(ciphertext).decode("ascii")
-        plaintext = self.crypto.decrypt(envelope, file_id.encode("utf-8"))
+        plaintext = self.crypto.decrypt(envelope, str(file_id).encode("utf-8"))
         if self._sha256(plaintext) != record["plaintext_sha256"]:
             raise ValueError("decrypted plaintext integrity verification failed")
         return plaintext
