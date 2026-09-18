@@ -43,6 +43,32 @@ def _introspect(authorization: str) -> dict:
     return body["principal"]
 
 
+def exchange_scif_handle(authorization: str) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing JANUS bearer token")
+    s = load_settings()
+    base = s.janus_introspect_url.rsplit("/v1/auth/introspect", 1)[0]
+    req = request.Request(
+        base + "/v1/auth/scif-handle",
+        method="POST",
+        data=b"",
+        headers={"Authorization": authorization, "Accept": "application/json"},
+    )
+    try:
+        with request.urlopen(req, timeout=s.janus_timeout_seconds) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as e:
+        if e.code in (400, 401, 403):
+            raise HTTPException(e.code, "JANUS SCIF authorization exchange denied") from e
+        raise HTTPException(503, "JANUS authorization service unavailable") from e
+    except Exception as e:
+        raise HTTPException(503, "JANUS authorization service unavailable") from e
+    token = body.get("access_token")
+    if not isinstance(token, str) or not token.startswith("scif_"):
+        raise HTTPException(503, "JANUS returned an invalid SCIF authorization handle")
+    return "Bearer " + token
+
+
 def principal_from_authorization(authorization: str) -> Principal:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing JANUS bearer token")
