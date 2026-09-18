@@ -4,6 +4,9 @@ from urllib.parse import urlsplit, quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie, Header, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from .auth import Principal, authorize, require_principal, principal_from_authorization, exchange_scif_handle
 from .audit import append_audit, verify_chain
 from .crypto import decrypt_bytes, encrypt_bytes
@@ -36,6 +39,7 @@ class ScifSessionRequest(BaseModel):
 
 class ScifEnterRequest(BaseModel):
     session_token: str = Field(min_length=20, max_length=256)
+    device_public_jwk: dict
 
 class ScifEmergencyRevokeRequest(BaseModel):
     owner: str | None = Field(default=None, max_length=256)
@@ -305,6 +309,59 @@ def get_document_markings(profile_code: str, document_id: str, p: Principal = De
         "print": print_marking(profile_code, document_id),
     }
 
+def _security_raise(cur, status_code: int, detail: str):
+    """Persist security state/audit before returning an HTTP denial."""
+    cur.connection.commit()
+    raise HTTPException(status_code, detail)
+
+
+def _b64url_decode(text: str) -> bytes:
+    padding = "=" * (-len(text) % 4)
+    return __import__("base64").urlsafe_b64decode(text + padding)
+
+
+def _validate_scif_device_jwk(jwk: dict) -> dict:
+    if not isinstance(jwk, dict) or jwk.get("kty") != "EC" or jwk.get("crv") != "P-256":
+        raise HTTPException(400, "SCIF device key must be an EC P-256 public key")
+    if not isinstance(jwk.get("x"), str) or not isinstance(jwk.get("y"), str):
+        raise HTTPException(400, "SCIF device public key is incomplete")
+    try:
+        x = int.from_bytes(_b64url_decode(jwk["x"]), "big")
+        y = int.from_bytes(_b64url_decode(jwk["y"]), "big")
+        ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
+    except Exception as exc:
+        raise HTTPException(400, "SCIF device public key is invalid") from exc
+    return {"kty": "EC", "crv": "P-256", "x": jwk["x"], "y": jwk["y"], "ext": True}
+
+
+def _verify_scif_device_proof(request: Request, row) -> None:
+    jwk = row.get("device_public_jwk")
+    if not jwk:
+        raise HTTPException(401, "SCIF session requires cryptographic device re-entry")
+    timestamp = request.headers.get("x-ung-scif-time", "")
+    signature_text = request.headers.get("x-ung-scif-proof", "")
+    try:
+        ts = int(timestamp)
+    except Exception:
+        raise HTTPException(401, "SCIF device proof timestamp required")
+    now_s = int(utcnow().timestamp())
+    if abs(now_s - ts) > 30:
+        raise HTTPException(401, "SCIF device proof is stale")
+    canonical = f"{request.method.upper()}\n{request.url.path}\n{timestamp}\n{row['id']}".encode("utf-8")
+    try:
+        x = int.from_bytes(_b64url_decode(jwk["x"]), "big")
+        y = int.from_bytes(_b64url_decode(jwk["y"]), "big")
+        pub = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
+        raw = _b64url_decode(signature_text)
+        if len(raw) != 64:
+            raise ValueError("bad signature length")
+        r = int.from_bytes(raw[:32], "big")
+        s = int.from_bytes(raw[32:], "big")
+        pub.verify(encode_dss_signature(r, s), canonical, ec.ECDSA(hashes.SHA256()))
+    except Exception as exc:
+        raise HTTPException(403, "SCIF cryptographic device proof failed") from exc
+
+
 def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str = "", session_id: str | None = None, object_id: str | None = None, owner: str | None = None) -> bool:
     if not SENTINEL_BASE_URL or not SENTINEL_INGEST_SECRET:
         return False
@@ -346,6 +403,7 @@ def _clear_scif_sensitive_state(cur, session_id: str, *, state: str | None = Non
         "approved_at='{}'::jsonb",
         "failed_entry_attempts=0",
         "failed_cookie_attempts=0",
+        "device_public_jwk=NULL",
     ]
     params = []
     if state is not None:
@@ -409,7 +467,7 @@ def _record_scif_auth_failure(cur, row, *, kind: str, actor: str, action: str):
             object_id=str(row["object_id"]),
             owner=row["owner"],
         )
-        raise HTTPException(423, "SCIF session revoked after repeated authentication failures")
+        _security_raise(cur, 423, "SCIF session revoked after repeated authentication failures")
     return attempts
 
 
@@ -480,7 +538,7 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
             object_id=str(row["object_id"]),
             owner=row["owner"],
         )
-        raise HTTPException(403, "SCIF device identity changed")
+        _security_raise(cur, 403, "SCIF device identity changed")
     actual = _request_device_binding(request, current_claim or stored_claim)
     if not secrets.compare_digest(expected, actual):
         _clear_scif_sensitive_state(
@@ -499,7 +557,7 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
             object_id=str(row["object_id"]),
             owner=row["owner"],
         )
-        raise HTTPException(403, "SCIF session is bound to a different device/browser")
+        _security_raise(cur, 403, "SCIF session is bound to a different device/browser")
 
 
 def _fresh_scif_approvals(row):
@@ -570,8 +628,8 @@ def _enforce_scif_idle(cur, row):
             "idle_limit_seconds": SCIF_IDLE_SECONDS,
         })
         if row.get("mode") == "scif_two_person":
-            raise HTTPException(423, "SCIF session locked after inactivity; fresh independent approvals required")
-        raise HTTPException(423, "SCIF session locked after inactivity; re-entry required")
+            _security_raise(cur, 423, "SCIF session locked after inactivity; fresh independent approvals required")
+        _security_raise(cur, 423, "SCIF session locked after inactivity; re-entry required")
 
 
 def _continuous_scif_check(cur, row):
@@ -608,6 +666,7 @@ def _continuous_scif_check(cur, row):
                 object_id=str(row["object_id"]),
                 owner=row["owner"],
             )
+            cur.connection.commit()
         raise
     cur.execute("UPDATE vault_scif_sessions SET last_verified_at=now() WHERE id=%s", (str(row["id"]),))
     return current
@@ -742,6 +801,7 @@ def enter_scif_session(
     require_trusted_device(p)
     require_fresh_mfa(p)
     token_hash = hashlib.sha256(req.session_token.encode()).hexdigest()
+    device_jwk = _validate_scif_device_jwk(req.device_public_jwk)
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM vault_scif_sessions WHERE id=%s FOR UPDATE", (session_id,))
@@ -752,19 +812,19 @@ def enter_scif_session(
                 raise HTTPException(403, "Only the session owner may enter this SCIF session")
             if row["expires_at"] <= utcnow():
                 _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
-                raise HTTPException(410, "SCIF session expired")
+                _security_raise(cur, 410, "SCIF session expired")
             if row["mode"] == "scif_two_person":
                 fresh = _fresh_scif_approvals(row)
                 if approval_count(fresh) < int(row["approvals_required"]):
                     cur.execute("UPDATE vault_scif_sessions SET state='pending' WHERE id=%s", (session_id,))
-                    raise HTTPException(409, "Fresh two-person approvals required before SCIF entry")
+                    _security_raise(cur, 409, "Fresh two-person approvals required before SCIF entry")
             if row["state"] not in {"active", "locked"}:
                 raise HTTPException(409, "SCIF session is not enterable")
             if not secrets.compare_digest(token_hash, row["token_hash"]):
                 _record_scif_auth_failure(
                     cur, row, kind="entry", actor=p.subject, action="scif_enter_denied"
                 )
-                raise HTTPException(403, "Invalid SCIF session token")
+                _security_raise(cur, 403, "Invalid SCIF session token")
             superseded = _supersede_other_scif_sessions(cur, p.subject, session_id)
             scif_authorization = exchange_scif_handle(authorization)
             auth_envelope = encrypt_bytes(scif_authorization.encode("utf-8"), session_id.encode())
@@ -773,14 +833,15 @@ def enter_scif_session(
             cookie_secret = new_session_token()
             cookie_hash = hashlib.sha256(cookie_secret.encode()).hexdigest()
             cur.execute(
-                "UPDATE vault_scif_sessions SET state='active',opened_at=COALESCE(opened_at,now()),auth_envelope=%s::jsonb,last_verified_at=now(),revoked_reason=NULL,device_binding_hash=%s,device_claim=%s,cookie_hash=%s,failed_entry_attempts=0,failed_cookie_attempts=0 WHERE id=%s",
-                (json.dumps(auth_envelope), device_binding_hash, device_claim, cookie_hash, session_id),
+                "UPDATE vault_scif_sessions SET state='active',opened_at=COALESCE(opened_at,now()),auth_envelope=%s::jsonb,last_verified_at=now(),revoked_reason=NULL,device_binding_hash=%s,device_claim=%s,cookie_hash=%s,failed_entry_attempts=0,failed_cookie_attempts=0,device_public_jwk=%s::jsonb WHERE id=%s",
+                (json.dumps(auth_envelope), device_binding_hash, device_claim, cookie_hash, json.dumps(device_jwk), session_id),
             )
             append_audit(cur, p.subject, "scif_entered", str(row["object_id"]), {
                 "session_id": session_id,
                 "mode": row["mode"],
                 "continuous_authorization": True,
                 "janus_scoped_handle": True,
+                "cryptographic_device_binding": True,
                 "device_bound": True,
                 "janus_device_claim": bool(device_claim),
                 "browser_secret_rotated": True,
@@ -824,7 +885,7 @@ def view_scif_session(
                 raise HTTPException(404, "SCIF session not found")
             if row["expires_at"] <= utcnow():
                 _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
-                raise HTTPException(410, "SCIF session expired")
+                _security_raise(cur, 410, "SCIF session expired")
             _enforce_scif_idle(cur, row)
             if row["state"] != "active":
                 raise HTTPException(403, "SCIF session is not active")
@@ -832,7 +893,7 @@ def view_scif_session(
                 _record_scif_auth_failure(
                     cur, row, kind="cookie", actor=row["owner"], action="scif_view_denied"
                 )
-                raise HTTPException(403, "Invalid SCIF session")
+                _security_raise(cur, 403, "Invalid SCIF session")
             if row.get("failed_cookie_attempts"):
                 cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
@@ -872,7 +933,7 @@ def render_scif_document(
                 raise HTTPException(404, "SCIF session not found")
             if row["expires_at"] <= utcnow():
                 _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
-                raise HTTPException(410, "SCIF session expired")
+                _security_raise(cur, 410, "SCIF session expired")
             _enforce_scif_idle(cur, row)
             if row["state"] != "active":
                 raise HTTPException(403, "SCIF session is not active")
@@ -880,11 +941,12 @@ def render_scif_document(
                 _record_scif_auth_failure(
                     cur, row, kind="cookie", actor=row["owner"], action="scif_render_denied"
                 )
-                raise HTTPException(403, "Invalid SCIF session")
+                _security_raise(cur, 403, "Invalid SCIF session")
             if row.get("failed_cookie_attempts"):
                 cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
+            _verify_scif_device_proof(request, row)
             try:
                 value = decrypt_bytes(row["envelope"], str(row["object_id"]).encode()).decode()
                 pixels = render_scif_image(
@@ -938,7 +1000,7 @@ def scif_heartbeat(
                 raise HTTPException(404, "SCIF session not found")
             if row["expires_at"] <= utcnow():
                 _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
-                raise HTTPException(410, "SCIF session expired")
+                _security_raise(cur, 410, "SCIF session expired")
             _enforce_scif_idle(cur, row)
             if row["state"] != "active":
                 raise HTTPException(403, "SCIF session is not active")
@@ -946,11 +1008,12 @@ def scif_heartbeat(
                 _record_scif_auth_failure(
                     cur, row, kind="cookie", actor=row["owner"], action="scif_heartbeat_denied"
                 )
-                raise HTTPException(403, "Invalid SCIF session")
+                _security_raise(cur, 403, "Invalid SCIF session")
             if row.get("failed_cookie_attempts"):
                 cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
+            _verify_scif_device_proof(request, row)
             return Response(
                 content=json.dumps({"active": True, "verified_at": utcnow().isoformat()}),
                 media_type="application/json",
