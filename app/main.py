@@ -56,6 +56,7 @@ class StoreRequest(BaseModel):
 def startup():
     load_settings()
     init_db()
+    print("SENTINEL_SIGNED_CHANNEL=" + ("ok" if _sentinel_signed_probe() else "degraded"))
 
 @app.get("/health")
 def health():
@@ -1029,7 +1030,7 @@ def render_scif_document(
                 raise
             except Exception:
                 append_audit(cur, row["owner"], "scif_render_failed", str(row["object_id"]), {"session_id": session_id})
-                raise HTTPException(409, "SCIF document render failed")
+                _security_raise(cur, 409, "SCIF document render failed")
             append_audit(cur, row["owner"], "scif_document_rasterized", str(row["object_id"]), {"session_id": session_id})
             return Response(
                 pixels,
