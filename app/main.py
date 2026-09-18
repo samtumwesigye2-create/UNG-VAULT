@@ -31,6 +31,7 @@ from .db import connect, init_db
 from .config import load_settings
 
 app = FastAPI(title="UNG-VAULT", version="1.1.0")
+PRESIDENT_INGEST_SECRET = os.getenv("PRESIDENT_INGEST_SECRET", "")
 
 class ScifSessionRequest(BaseModel):
     object_id: str
@@ -44,6 +45,14 @@ class ScifEnterRequest(BaseModel):
 class ScifEmergencyRevokeRequest(BaseModel):
     owner: str | None = Field(default=None, max_length=256)
     reason: str = Field(min_length=3, max_length=500)
+
+class PresidentRecordRequest(BaseModel):
+    record_type: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=200)
+    principal: str = Field(min_length=1, max_length=200)
+    classification: str = "confidential"
+    protection_profile: str = "VAULT-ENVELOPE"
+    payload: dict
 
 class StoreRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -77,6 +86,52 @@ def ready():
         }
     except Exception as e:
         raise HTTPException(503, f"not ready: {type(e).__name__}")
+
+def _verify_president_record_signature(req: PresidentRecordRequest, signature: str | None) -> None:
+    if not PRESIDENT_INGEST_SECRET:
+        raise HTTPException(503, "president_ingest_not_configured")
+    raw = json.dumps(req.model_dump(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    expected = hmac.new(PRESIDENT_INGEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    if not signature or not hmac.compare_digest(expected, signature):
+        raise HTTPException(401, "invalid_president_signature")
+
+
+@app.post("/vault/integrations/president/records", status_code=201)
+def ingest_president_record(
+    req: PresidentRecordRequest,
+    x_ung_president_signature: str | None = Header(None),
+):
+    _verify_president_record_signature(req, x_ung_president_signature)
+    if req.classification not in {"public", "internal", "confidential", "restricted", "top_secret"}:
+        raise HTTPException(400, "invalid_classification")
+    if req.protection_profile not in PROFILES:
+        raise HTTPException(400, "unknown_protection_profile")
+    object_id = str(uuid.uuid4())
+    value = json.dumps(req.payload, sort_keys=True, separators=(",", ":"))
+    envelope = encrypt_bytes(value.encode("utf-8"), object_id.encode())
+    compartment = "executive-presidency"
+    created_by = "UNG-PRESIDENT:" + req.principal
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
+                (object_id, compartment, req.classification, req.protection_profile, req.name, json.dumps(envelope), created_by),
+            )
+            append_audit(cur, created_by, "president_record_ingested", object_id, {
+                "record_type": req.record_type,
+                "classification": req.classification,
+                "protection_profile": req.protection_profile,
+                "source": "UNG-PRESIDENT",
+            })
+    return {
+        "id": object_id,
+        "record_type": req.record_type,
+        "classification": req.classification,
+        "protection_profile": req.protection_profile,
+        "compartment": compartment,
+        "encrypted": True,
+    }
+
 
 @app.post("/vault/objects")
 def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
