@@ -235,3 +235,12 @@ Digital SCIF session exit paths now use a common sensitive-state wipe.
 - Expiry, explicit close, administrative revoke, device mismatch, and continuous-authorization revocation clear the encrypted JANUS context, active browser-secret hash, device binding, approvals, and authentication-failure counters.
 - The SCIF cookie lifetime is now limited to the actual remaining session lifetime instead of a fixed 120-minute browser lifetime.
 - Session-status checks include approval timestamps so fresh two-person approvals are reported correctly.
+
+
+### SCIF-scoped JANUS handle
+VAULT no longer needs to retain the user's full JANUS bearer token for continuous SCIF checks.
+
+- At SCIF entry, VAULT exchanges the current freshly MFA-authenticated JANUS session for a short-lived SCIF-scoped authorization handle.
+- VAULT encrypts that narrower handle inside the SCIF session record and uses it for continuous introspection.
+- The handle is valid only while the parent JANUS session remains valid and while the short SCIF-handle TTL has not expired.
+- This reduces the impact of a VAULT database compromise compared with storing a reusable full-session bearer token.
