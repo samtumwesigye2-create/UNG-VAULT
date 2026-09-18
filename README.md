@@ -262,3 +262,12 @@ Security classification and VAULT cryptographic profile are now modeled independ
 - `protection_profile` selects the VAULT protection mode and its color/document marking, such as `VAULT-ONE`, `VAULT-LEGACY`, or `VAULT-PQ`.
 - A protection profile is not treated as a clearance label, and a classification is not treated as a cryptographic mode.
 - Existing objects with no stored protection profile fall back to `VAULT-ENVELOPE` for display/marking compatibility.
+
+
+### SENTINEL security-event integration
+Critical Digital SCIF security events are forwarded to UNG-SENTINEL over a signed service-to-service channel.
+
+- VAULT signs each security event with HMAC-SHA256 using a shared deployment secret that is stored only in Railway environment variables.
+- SENTINEL verifies the signature before creating an alert.
+- Forwarded events include SCIF authentication lockout, device identity change, browser/device binding mismatch, continuous-authorization revocation, and emergency SCIF revocation.
+- SENTINEL delivery is best-effort and never blocks the underlying VAULT security action; the local tamper-evident VAULT audit chain remains authoritative.
