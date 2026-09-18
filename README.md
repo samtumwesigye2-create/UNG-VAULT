@@ -99,3 +99,37 @@ Selective redaction is optional. UNG-VAULT always keeps a direct full-file encry
 - Decryption uses the existing authenticated `POST /vault/files/decrypt` workflow.
 
 This guarantees that redaction never replaces or blocks VAULT's original full-file encryption capability.
+
+
+## Digital SCIF mode
+UNG-VAULT includes a high-assurance Digital SCIF viewing mode for restricted and top-secret objects.
+
+Digital SCIF is a software containment control. It does **not** replace or claim physical ICD 705 accreditation, RF/TEMPEST shielding, acoustic isolation, or other facility controls.
+
+Controls implemented:
+- JANUS top-secret clearance and explicit SCIF entitlement.
+- MFA-authenticated session requirement.
+- JANUS trusted-device posture requirement.
+- Compartment authorization remains mandatory.
+- Time-limited sessions from 5 to 120 minutes.
+- Optional **SCIF + two-person control** requiring two independent SCIF-authorized approvers.
+- Session owner cannot self-approve.
+- Secure, HttpOnly, SameSite=Strict SCIF entry cookie.
+- No-store/no-cache response policy and restrictive CSP/permissions policy.
+- Browser-side print, copy, cut, paste, save and context-menu deterrence.
+- Dynamic viewer/session/timestamp watermarking.
+- Server-side decryption only for the active request; plaintext is not persisted to a SCIF workspace.
+- Session close/revocation endpoint and expiration enforcement.
+- Tamper-evident audit events for creation, approvals, entry, viewing, denied entry and closure.
+
+Browser controls cannot guarantee prevention of operating-system-level screenshots or photography. Watermarking provides attribution/deterrence when capture cannot be technically prevented.
+
+Typical flow:
+```
+JANUS identity + MFA + trusted device
+  -> top-secret clearance + compartment
+  -> create SCIF session
+  -> optional independent approvals
+  -> enter controlled viewer
+  -> session expires / closes / is revoked
+```
