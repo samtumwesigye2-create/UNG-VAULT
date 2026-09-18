@@ -8,6 +8,7 @@ from .auth import Principal, authorize, require_principal
 from .audit import append_audit, verify_chain
 from .crypto import decrypt_bytes, encrypt_bytes
 from .redaction import redact_file
+from .share_package import build_share_package, unlock_share_package
 from .db import connect, init_db
 from .config import load_settings
 
@@ -157,6 +158,61 @@ async def redact_shared_copy(
             "X-UNG-VAULT-Redaction": str(percentage),
         },
     )
+
+@app.post("/vault/files/share-package")
+async def create_share_package(
+    file: UploadFile = File(...),
+    percentage: int = Form(...),
+    access_code: str = Form(...),
+    p: Principal = Depends(require_principal),
+):
+    data = await file.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
+    name = _safe_name(file.filename)
+    try:
+        payload = build_share_package(data, name, file.content_type or "application/octet-stream", percentage, access_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    event_id = str(uuid.uuid4())
+    with connect() as conn:
+        with conn.cursor() as cur:
+            append_audit(cur, p.subject, "share_package_created", event_id, {
+                "filename": name,
+                "bytes": len(data),
+                "percentage": percentage,
+                "full_access_code": True,
+            })
+    out = (Path(name).stem[:150] or "file") + ".ungshare"
+    return Response(payload, media_type="application/vnd.ung.vault-share+zip", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(out)}",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+@app.post("/vault/files/share-unlock")
+async def unlock_share(
+    file: UploadFile = File(...),
+    access_code: str = Form(...),
+    p: Principal = Depends(require_principal),
+):
+    raw = await file.read(MAX_FILE_BYTES + MAX_FILE_BYTES + 2 * 1024 * 1024)
+    try:
+        data, name, media_type = unlock_share_package(raw, access_code)
+    except ValueError as exc:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                append_audit(cur, p.subject, "share_unlock_denied", detail={"reason": str(exc)})
+        raise HTTPException(403, str(exc)) from None
+    event_id = str(uuid.uuid4())
+    with connect() as conn:
+        with conn.cursor() as cur:
+            append_audit(cur, p.subject, "share_unlocked", event_id, {"filename": name, "bytes": len(data)})
+    return Response(data, media_type=media_type or "application/octet-stream", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(_safe_name(name))}",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+    })
 
 @app.get("/audit/verify")
 def audit_verify(p: Principal = Depends(require_principal)):
