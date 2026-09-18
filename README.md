@@ -218,3 +218,12 @@ UNG-VAULT includes an emergency Digital SCIF kill switch.
 - Fresh MFA and a JANUS-trusted device are required before the kill switch can run.
 - Revocation destroys encrypted JANUS context, browser-secret hashes, device bindings, and approval state.
 - Every affected session plus the overall emergency action is written to the tamper-evident VAULT audit chain with the supplied reason.
+
+
+### SCIF authentication lockout
+Digital SCIF sessions now track repeated authentication failures.
+
+- Invalid SCIF entry tokens are counted per session. The default limit is 5 failures, configurable with `VAULT_SCIF_MAX_ENTRY_FAILURES`.
+- Invalid active-browser SCIF secrets are counted separately. The default limit is 3 failures, configurable with `VAULT_SCIF_MAX_COOKIE_FAILURES`.
+- Crossing either limit immediately revokes the SCIF session, destroys its live JANUS authorization context, browser secret, device binding and approval state, and records the event in the tamper-evident audit chain.
+- A successful SCIF entry resets both counters, and a valid live browser request clears accumulated cookie failures.
