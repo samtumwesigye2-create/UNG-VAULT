@@ -133,3 +133,15 @@ JANUS identity + MFA + trusted device
   -> enter controlled viewer
   -> session expires / closes / is revoked
 ```
+
+
+### Continuous SCIF authorization
+Active SCIF viewing is continuously re-authorized against JANUS rather than relying only on the original entry decision.
+
+- The JANUS bearer context is stored only as a VAULT-encrypted session envelope.
+- Every SCIF view request performs a fresh JANUS introspection before plaintext is released.
+- The controlled viewer sends a same-origin authorization heartbeat every 15 seconds.
+- Each check re-validates identity, SCIF entitlement, MFA state, trusted-device posture, clearance and compartment access.
+- If identity or authorization is revoked or changes, VAULT revokes the SCIF session and destroys the stored encrypted JANUS context.
+- If JANUS is temporarily unavailable, the viewer fails closed immediately but the session is not permanently revoked solely because of the outage.
+- Closing, revoking or expiring a session destroys the stored SCIF authorization envelope.
