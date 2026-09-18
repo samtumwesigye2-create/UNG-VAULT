@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   state TEXT NOT NULL DEFAULT 'pending',
   approvals_required INTEGER NOT NULL DEFAULT 0,
   approved_by JSONB NOT NULL DEFAULT '[]'::jsonb,
+  approved_at JSONB NOT NULL DEFAULT '{}'::jsonb,
   token_hash TEXT NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   device_claim TEXT,
   cookie_hash TEXT
 );
+ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS approved_at JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS cookie_hash TEXT;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS device_binding_hash TEXT;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS device_claim TEXT;
