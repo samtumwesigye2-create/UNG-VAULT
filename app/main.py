@@ -17,6 +17,7 @@ from .scif import (
     require_scif_entitlement,
     require_trusted_device,
     require_recent_mfa,
+    require_fresh_mfa,
     session_minutes,
     approval_count,
     render_scif_view,
@@ -404,7 +405,7 @@ def _continuous_scif_check(cur, row):
             raise HTTPException(403, "SCIF identity changed")
         require_scif_entitlement(current)
         require_trusted_device(current)
-        require_recent_mfa(current)
+        require_fresh_mfa(current)
         authorize(current, row["classification"], row["compartment"])
     except HTTPException as exc:
         # Identity/authorization failures revoke the active SCIF. Temporary JANUS
@@ -426,7 +427,7 @@ def _continuous_scif_check(cur, row):
 def create_scif_session(req: ScifSessionRequest, p: Principal = Depends(require_principal)):
     require_scif_entitlement(p)
     require_trusted_device(p)
-    require_recent_mfa(p)
+    require_fresh_mfa(p)
     if req.mode not in SCIF_MODES:
         raise HTTPException(400, "Invalid SCIF mode")
     minutes = session_minutes(req.duration_minutes)
@@ -478,7 +479,7 @@ def create_scif_session(req: ScifSessionRequest, p: Principal = Depends(require_
 def approve_scif_session(session_id: str, p: Principal = Depends(require_principal)):
     require_scif_entitlement(p)
     require_trusted_device(p)
-    require_recent_mfa(p)
+    require_fresh_mfa(p)
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM vault_scif_sessions WHERE id=%s FOR UPDATE", (session_id,))
@@ -550,7 +551,7 @@ def enter_scif_session(
 ):
     require_scif_entitlement(p)
     require_trusted_device(p)
-    require_recent_mfa(p)
+    require_fresh_mfa(p)
     token_hash = hashlib.sha256(req.session_token.encode()).hexdigest()
     with connect() as conn:
         with conn.cursor() as cur:
