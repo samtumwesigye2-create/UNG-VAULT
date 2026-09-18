@@ -43,7 +43,7 @@ def _introspect(authorization: str) -> dict:
     return body["principal"]
 
 
-def require_principal(authorization: str = Header(None)) -> Principal:
+def principal_from_authorization(authorization: str) -> Principal:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing JANUS bearer token")
     claims = _introspect(authorization)
@@ -60,6 +60,10 @@ def require_principal(authorization: str = Header(None)) -> Principal:
         compartments.add("*")
 
     return Principal(str(claims.get("id", "")), clearance, frozenset(compartments), claims)
+
+
+def require_principal(authorization: str = Header(None)) -> Principal:
+    return principal_from_authorization(authorization)
 
 
 def authorize(p: Principal, classification: str, compartment: str) -> None:
