@@ -101,7 +101,8 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
             return {"id":str(row["id"]),"name":row["name"],"compartment":row["compartment"],"classification":row["classification"],"value":value,"marking": marking_payload(row["classification"], str(row["id"])) if row["classification"] in PROFILES else None}
 
 MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
-FILE_MAGIC = b"UNGVAULT1\n"\nSCIF_IDLE_SECONDS = max(30, min(900, int(os.getenv("VAULT_SCIF_IDLE_SECONDS", "90"))))
+FILE_MAGIC = b"UNGVAULT1\n"
+SCIF_IDLE_SECONDS = max(30, min(900, int(os.getenv("VAULT_SCIF_IDLE_SECONDS", "90"))))
 
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
@@ -502,7 +503,7 @@ def enter_scif_session(
                 raise HTTPException(410, "SCIF session expired")
             if row["state"] not in {"active", "locked"}:
                 raise HTTPException(409, "SCIF session is not enterable")
-            if not row.get("cookie_hash") or not secrets.compare_digest(token_hash, row["cookie_hash"]):
+            if not secrets.compare_digest(token_hash, row["token_hash"]):
                 append_audit(cur, p.subject, "scif_enter_denied", str(row["object_id"]), {"session_id": session_id})
                 raise HTTPException(403, "Invalid SCIF session token")
             auth_envelope = encrypt_bytes(authorization.encode("utf-8"), session_id.encode())
