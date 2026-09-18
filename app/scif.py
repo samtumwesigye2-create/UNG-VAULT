@@ -153,14 +153,14 @@ def render_scif_image(
             drop_whitespace=False,
         )
         lines.extend(wrapped or [""])
-    lines = lines[:4000]
+    lines = lines[:1500]
 
     probe = Image.new("RGB", (10, 10), "white")
     pd = ImageDraw.Draw(probe)
     bbox = pd.textbbox((0, 0), "Ag", font=font)
     line_h = max(16, bbox[3] - bbox[1] + line_gap)
     width = 1400
-    height = min(50000, max(500, margin * 2 + line_h * max(1, len(lines)) + 90))
+    height = min(12000, max(500, margin * 2 + line_h * max(1, len(lines)) + 90))
 
     image = Image.new("RGB", (width, height), (10, 16, 24))
     draw = ImageDraw.Draw(image)
