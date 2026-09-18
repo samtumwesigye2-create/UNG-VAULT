@@ -1,7 +1,7 @@
-import json, uuid, os
+import json, uuid, os, hashlib
 from pathlib import Path
 from urllib.parse import urlsplit, quote
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from .auth import Principal, authorize, require_principal
@@ -11,10 +11,29 @@ from .redaction import redact_file
 from .document_markings import marking_payload, pdf_marking, print_marking
 from .access_policy import PROFILES, VAULT_DOCUMENT_COLORS
 from .share_package import build_share_package, unlock_share_package
+from .scif import (
+    SCIF_MODES,
+    new_session_token,
+    require_scif_entitlement,
+    require_trusted_device,
+    require_recent_mfa,
+    session_minutes,
+    approval_count,
+    render_scif_view,
+    utcnow,
+)
 from .db import connect, init_db
 from .config import load_settings
 
 app = FastAPI(title="UNG-VAULT", version="1.1.0")
+
+class ScifSessionRequest(BaseModel):
+    object_id: str
+    mode: str = "scif"
+    duration_minutes: int = 30
+
+class ScifEnterRequest(BaseModel):
+    session_token: str = Field(min_length=20, max_length=256)
 
 class StoreRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -240,6 +259,214 @@ def get_document_markings(profile_code: str, document_id: str, p: Principal = De
         "pdf": pdf_marking(profile_code, document_id),
         "print": print_marking(profile_code, document_id),
     }
+
+@app.post("/vault/scif/sessions")
+def create_scif_session(req: ScifSessionRequest, p: Principal = Depends(require_principal)):
+    require_scif_entitlement(p)
+    require_trusted_device(p)
+    require_recent_mfa(p)
+    if req.mode not in SCIF_MODES:
+        raise HTTPException(400, "Invalid SCIF mode")
+    minutes = session_minutes(req.duration_minutes)
+    try:
+        object_uuid = str(uuid.UUID(req.object_id))
+    except Exception:
+        raise HTTPException(400, "Invalid object ID") from None
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,compartment,classification FROM vault_objects WHERE id=%s", (object_uuid,))
+            obj = cur.fetchone()
+            if not obj:
+                raise HTTPException(404, "Object not found")
+            authorize(p, obj["classification"], obj["compartment"])
+            if obj["classification"] not in {"restricted", "top_secret"}:
+                raise HTTPException(400, "SCIF mode is reserved for restricted or top-secret objects")
+
+            session_id = str(uuid.uuid4())
+            token = new_session_token()
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            approvals_required = int(SCIF_MODES[req.mode]["approvals_required"])
+            state = "active" if approvals_required == 0 else "pending"
+            expires_at = utcnow() + __import__("datetime").timedelta(minutes=minutes)
+            cur.execute(
+                """INSERT INTO vault_scif_sessions
+                   (id,object_id,owner,mode,state,approvals_required,approved_by,token_hash,expires_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,'[]'::jsonb,%s,%s)""",
+                (session_id, object_uuid, p.subject, req.mode, state, approvals_required, token_hash, expires_at),
+            )
+            append_audit(cur, p.subject, "scif_session_created", object_uuid, {
+                "session_id": session_id,
+                "mode": req.mode,
+                "approvals_required": approvals_required,
+                "duration_minutes": minutes,
+                "state": state,
+            })
+    return {
+        "session_id": session_id,
+        "session_token": token,
+        "state": state,
+        "mode": req.mode,
+        "approvals_required": approvals_required,
+        "expires_at": expires_at.isoformat(),
+        "notice": "Session token is shown once. Keep it inside the authenticated VAULT workflow.",
+    }
+
+@app.post("/vault/scif/sessions/{session_id}/approve")
+def approve_scif_session(session_id: str, p: Principal = Depends(require_principal)):
+    require_scif_entitlement(p)
+    require_trusted_device(p)
+    require_recent_mfa(p)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM vault_scif_sessions WHERE id=%s FOR UPDATE", (session_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SCIF session not found")
+            if row["expires_at"] <= utcnow() or row["state"] in {"closed", "revoked", "expired"}:
+                raise HTTPException(409, "SCIF session is no longer approvable")
+            if p.subject == row["owner"]:
+                raise HTTPException(403, "Session owner cannot approve their own SCIF request")
+            cur.execute("SELECT compartment,classification FROM vault_objects WHERE id=%s", (row["object_id"],))
+            obj = cur.fetchone()
+            authorize(p, obj["classification"], obj["compartment"])
+            approved = list(row["approved_by"] or [])
+            if p.subject not in approved:
+                approved.append(p.subject)
+            state = "active" if approval_count(approved) >= int(row["approvals_required"]) else "pending"
+            cur.execute("UPDATE vault_scif_sessions SET approved_by=%s::jsonb,state=%s WHERE id=%s",
+                        (json.dumps(approved), state, session_id))
+            append_audit(cur, p.subject, "scif_session_approved", str(row["object_id"]), {
+                "session_id": session_id,
+                "approvals": len(approved),
+                "approvals_required": int(row["approvals_required"]),
+                "state": state,
+            })
+            return {"session_id": session_id, "state": state, "approvals": len(approved), "approvals_required": int(row["approvals_required"])}
+
+@app.get("/vault/scif/sessions/{session_id}")
+def scif_session_status(session_id: str, p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,object_id,owner,mode,state,approvals_required,approved_by,expires_at,created_at,opened_at,closed_at FROM vault_scif_sessions WHERE id=%s", (session_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SCIF session not found")
+            if p.subject != row["owner"]:
+                require_scif_entitlement(p)
+            state = row["state"]
+            if row["expires_at"] <= utcnow() and state not in {"closed","revoked","expired"}:
+                state = "expired"
+                cur.execute("UPDATE vault_scif_sessions SET state='expired' WHERE id=%s", (session_id,))
+            return {
+                "session_id": str(row["id"]),
+                "object_id": str(row["object_id"]),
+                "owner": row["owner"],
+                "mode": row["mode"],
+                "state": state,
+                "approvals": approval_count(row["approved_by"]),
+                "approvals_required": int(row["approvals_required"]),
+                "expires_at": row["expires_at"].isoformat(),
+                "opened_at": row["opened_at"].isoformat() if row["opened_at"] else None,
+                "closed_at": row["closed_at"].isoformat() if row["closed_at"] else None,
+            }
+
+@app.post("/vault/scif/sessions/{session_id}/enter")
+def enter_scif_session(req: ScifEnterRequest, session_id: str, p: Principal = Depends(require_principal)):
+    require_scif_entitlement(p)
+    require_trusted_device(p)
+    require_recent_mfa(p)
+    token_hash = hashlib.sha256(req.session_token.encode()).hexdigest()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM vault_scif_sessions WHERE id=%s FOR UPDATE", (session_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SCIF session not found")
+            if p.subject != row["owner"]:
+                raise HTTPException(403, "Only the session owner may enter this SCIF session")
+            if row["expires_at"] <= utcnow():
+                cur.execute("UPDATE vault_scif_sessions SET state='expired' WHERE id=%s", (session_id,))
+                raise HTTPException(410, "SCIF session expired")
+            if row["state"] != "active":
+                raise HTTPException(409, "SCIF session is not active")
+            if not secrets.compare_digest(token_hash, row["token_hash"]):
+                append_audit(cur, p.subject, "scif_enter_denied", str(row["object_id"]), {"session_id": session_id})
+                raise HTTPException(403, "Invalid SCIF session token")
+            cur.execute("UPDATE vault_scif_sessions SET opened_at=COALESCE(opened_at,now()) WHERE id=%s", (session_id,))
+            append_audit(cur, p.subject, "scif_entered", str(row["object_id"]), {"session_id": session_id, "mode": row["mode"]})
+    resp = Response(status_code=204)
+    resp.set_cookie(
+        "UNG_SCIF_SESSION",
+        f"{session_id}:{req.session_token}",
+        max_age=60 * 120,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/vault/scif/",
+    )
+    return resp
+
+@app.get("/vault/scif/view/{session_id}", response_class=Response)
+def view_scif_session(session_id: str, ung_scif_session: str | None = Cookie(default=None, alias="UNG_SCIF_SESSION")):
+    if not ung_scif_session or ":" not in ung_scif_session:
+        raise HTTPException(401, "SCIF session cookie required")
+    cookie_session, token = ung_scif_session.split(":", 1)
+    if cookie_session != session_id:
+        raise HTTPException(403, "SCIF session mismatch")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT s.*,o.name,o.compartment,o.classification,o.envelope
+                   FROM vault_scif_sessions s JOIN vault_objects o ON o.id=s.object_id
+                   WHERE s.id=%s FOR UPDATE""",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SCIF session not found")
+            if row["expires_at"] <= utcnow():
+                cur.execute("UPDATE vault_scif_sessions SET state='expired',closed_at=COALESCE(closed_at,now()) WHERE id=%s", (session_id,))
+                raise HTTPException(410, "SCIF session expired")
+            if row["state"] != "active":
+                raise HTTPException(403, "SCIF session is not active")
+            if not secrets.compare_digest(token_hash, row["token_hash"]):
+                append_audit(cur, row["owner"], "scif_view_denied", str(row["object_id"]), {"session_id": session_id})
+                raise HTTPException(403, "Invalid SCIF session")
+            try:
+                value = decrypt_bytes(row["envelope"], str(row["object_id"]).encode()).decode()
+            except Exception:
+                append_audit(cur, row["owner"], "scif_decryption_failed", str(row["object_id"]), {"session_id": session_id})
+                raise HTTPException(409, "Ciphertext integrity verification failed")
+            append_audit(cur, row["owner"], "scif_object_viewed", str(row["object_id"]), {"session_id": session_id})
+            return render_scif_view(
+                session_id=session_id,
+                viewer=row["owner"],
+                classification=row["classification"],
+                compartment=row["compartment"],
+                name=row["name"],
+                value=value,
+                expires_at=row["expires_at"],
+            )
+
+@app.post("/vault/scif/sessions/{session_id}/close")
+def close_scif_session(session_id: str, p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM vault_scif_sessions WHERE id=%s FOR UPDATE", (session_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SCIF session not found")
+            roles = {str(x) for x in p.claims.get("roles", [])}
+            if p.subject != row["owner"] and "platform-admin" not in roles and "security-admin" not in roles:
+                raise HTTPException(403, "Not authorized to close this SCIF session")
+            state = "revoked" if p.subject != row["owner"] else "closed"
+            cur.execute("UPDATE vault_scif_sessions SET state=%s,closed_at=now() WHERE id=%s", (state, session_id))
+            append_audit(cur, p.subject, "scif_session_" + state, str(row["object_id"]), {"session_id": session_id})
+    resp = Response(status_code=204)
+    resp.delete_cookie("UNG_SCIF_SESSION", path="/vault/scif/")
+    return resp
 
 @app.get("/audit/verify")
 def audit_verify(p: Principal = Depends(require_principal)):
