@@ -1,12 +1,13 @@
 import json, uuid, os
 from pathlib import Path
 from urllib.parse import urlsplit, quote
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from .auth import Principal, authorize, require_principal
 from .audit import append_audit, verify_chain
 from .crypto import decrypt_bytes, encrypt_bytes
+from .redaction import redact_file
 from .db import connect, init_db
 from .config import load_settings
 
@@ -120,6 +121,42 @@ async def decrypt_file(file: UploadFile = File(...), p: Principal = Depends(requ
         with conn.cursor() as cur:
             append_audit(cur, p.subject, "file_decrypted", file_id, {"filename":name,"bytes":len(data)})
     return Response(data, media_type="application/octet-stream", headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name)}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+
+@app.post("/vault/files/redact")
+async def redact_shared_copy(
+    file: UploadFile = File(...),
+    percentage: int = Form(...),
+    p: Principal = Depends(require_principal),
+):
+    data = await file.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
+    name = _safe_name(file.filename)
+    try:
+        result = redact_file(data, percentage, file.content_type or "", name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    event_id = str(uuid.uuid4())
+    with connect() as conn:
+        with conn.cursor() as cur:
+            append_audit(cur, p.subject, "file_redacted", event_id, {
+                "filename": name,
+                "bytes": len(data),
+                "percentage": percentage,
+                "irreversible": True,
+            })
+    stem = Path(name).stem[:150] or "file"
+    out = stem + result.suffix
+    return Response(
+        result.data,
+        media_type=result.media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(out)}",
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-UNG-VAULT-Redaction": str(percentage),
+        },
+    )
 
 @app.get("/audit/verify")
 def audit_verify(p: Principal = Depends(require_principal)):
