@@ -102,7 +102,7 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
 
 MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 FILE_MAGIC = b"UNGVAULT1\n"
-SCIF_IDLE_SECONDS = max(30, min(900, int(os.getenv("VAULT_SCIF_IDLE_SECONDS", "90"))))
+SCIF_IDLE_SECONDS = max(30, min(900, int(os.getenv("VAULT_SCIF_IDLE_SECONDS", "90"))))\nSCIF_APPROVAL_TTL_SECONDS = max(60, min(900, int(os.getenv("VAULT_SCIF_APPROVAL_TTL_SECONDS", "300"))))
 
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
@@ -319,6 +319,26 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
         raise HTTPException(403, "SCIF session is bound to a different device/browser")
 
 
+def _fresh_scif_approvals(row):
+    approved = list(row.get("approved_by") or [])
+    approved_at = dict(row.get("approved_at") or {})
+    fresh = []
+    now = utcnow()
+    for subject in approved:
+        raw = approved_at.get(subject)
+        if not raw:
+            continue
+        try:
+            ts = __import__("datetime").datetime.fromisoformat(str(raw))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=__import__("datetime").timezone.utc)
+        except Exception:
+            continue
+        if (now - ts).total_seconds() <= SCIF_APPROVAL_TTL_SECONDS:
+            fresh.append(subject)
+    return fresh
+
+
 def _supersede_other_scif_sessions(cur, owner: str, keep_session_id: str):
     """Allow only one live SCIF session per identity at a time."""
     cur.execute(
@@ -351,15 +371,23 @@ def _enforce_scif_idle(cur, row):
         return
     idle_seconds = (utcnow() - last).total_seconds()
     if idle_seconds > SCIF_IDLE_SECONDS:
-        cur.execute(
-            "UPDATE vault_scif_sessions SET state='locked',auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,revoked_reason='idle_timeout',cookie_hash=NULL WHERE id=%s",
-            (str(row["id"]),),
-        )
+        if row.get("mode") == "scif_two_person":
+            cur.execute(
+                "UPDATE vault_scif_sessions SET state='pending',approved_by='[]'::jsonb,approved_at='{}'::jsonb,auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,revoked_reason='idle_timeout',cookie_hash=NULL WHERE id=%s",
+                (str(row["id"]),),
+            )
+        else:
+            cur.execute(
+                "UPDATE vault_scif_sessions SET state='locked',auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,revoked_reason='idle_timeout',cookie_hash=NULL WHERE id=%s",
+                (str(row["id"]),),
+            )
         append_audit(cur, row["owner"], "scif_idle_locked", str(row["object_id"]), {
             "session_id": str(row["id"]),
             "idle_seconds": int(idle_seconds),
             "idle_limit_seconds": SCIF_IDLE_SECONDS,
         })
+        if row.get("mode") == "scif_two_person":
+            raise HTTPException(423, "SCIF session locked after inactivity; fresh independent approvals required")
         raise HTTPException(423, "SCIF session locked after inactivity; re-entry required")
 
 
@@ -464,18 +492,25 @@ def approve_scif_session(session_id: str, p: Principal = Depends(require_princip
             obj = cur.fetchone()
             authorize(p, obj["classification"], obj["compartment"])
             approved = list(row["approved_by"] or [])
+            approved_at = dict(row.get("approved_at") or {})
             if p.subject not in approved:
                 approved.append(p.subject)
-            state = "active" if approval_count(approved) >= int(row["approvals_required"]) else "pending"
-            cur.execute("UPDATE vault_scif_sessions SET approved_by=%s::jsonb,state=%s WHERE id=%s",
-                        (json.dumps(approved), state, session_id))
+            approved_at[p.subject] = utcnow().isoformat()
+            temp = dict(row)
+            temp["approved_by"] = approved
+            temp["approved_at"] = approved_at
+            fresh = _fresh_scif_approvals(temp)
+            state = "active" if approval_count(fresh) >= int(row["approvals_required"]) else "pending"
+            cur.execute("UPDATE vault_scif_sessions SET approved_by=%s::jsonb,approved_at=%s::jsonb,state=%s WHERE id=%s",
+                        (json.dumps(approved), json.dumps(approved_at), state, session_id))
             append_audit(cur, p.subject, "scif_session_approved", str(row["object_id"]), {
                 "session_id": session_id,
-                "approvals": len(approved),
+                "approvals": len(fresh),
                 "approvals_required": int(row["approvals_required"]),
+                "approval_ttl_seconds": SCIF_APPROVAL_TTL_SECONDS,
                 "state": state,
             })
-            return {"session_id": session_id, "state": state, "approvals": len(approved), "approvals_required": int(row["approvals_required"])}
+            return {"session_id": session_id, "state": state, "approvals": len(fresh), "approvals_required": int(row["approvals_required"]), "approval_ttl_seconds": SCIF_APPROVAL_TTL_SECONDS}
 
 @app.get("/vault/scif/sessions/{session_id}")
 def scif_session_status(session_id: str, p: Principal = Depends(require_principal)):
@@ -497,7 +532,7 @@ def scif_session_status(session_id: str, p: Principal = Depends(require_principa
                 "owner": row["owner"],
                 "mode": row["mode"],
                 "state": state,
-                "approvals": approval_count(row["approved_by"]),
+                "approvals": approval_count(_fresh_scif_approvals(row)),
                 "approvals_required": int(row["approvals_required"]),
                 "expires_at": row["expires_at"].isoformat(),
                 "opened_at": row["opened_at"].isoformat() if row["opened_at"] else None,
@@ -527,6 +562,11 @@ def enter_scif_session(
             if row["expires_at"] <= utcnow():
                 cur.execute("UPDATE vault_scif_sessions SET state='expired' WHERE id=%s", (session_id,))
                 raise HTTPException(410, "SCIF session expired")
+            if row["mode"] == "scif_two_person":
+                fresh = _fresh_scif_approvals(row)
+                if approval_count(fresh) < int(row["approvals_required"]):
+                    cur.execute("UPDATE vault_scif_sessions SET state='pending' WHERE id=%s", (session_id,))
+                    raise HTTPException(409, "Fresh two-person approvals required before SCIF entry")
             if row["state"] not in {"active", "locked"}:
                 raise HTTPException(409, "SCIF session is not enterable")
             if not secrets.compare_digest(token_hash, row["token_hash"]):
