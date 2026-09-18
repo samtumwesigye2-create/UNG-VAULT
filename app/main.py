@@ -118,18 +118,19 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
                 authorize(p, row["classification"], row["compartment"])
             except HTTPException:
                 append_audit(cur, p.subject, "denied_read", object_id, {"classification":row["classification"],"compartment":row["compartment"]})
+                cur.connection.commit()
                 raise
             if row["classification"] in SCIF_REQUIRED_CLASSIFICATIONS:
                 append_audit(cur, p.subject, "direct_plaintext_blocked_scif_required", object_id, {
                     "classification": row["classification"],
                     "compartment": row["compartment"],
                 })
-                raise HTTPException(403, "Digital SCIF required for restricted or top-secret plaintext access")
+                _security_raise(cur, 403, "Digital SCIF required for restricted or top-secret plaintext access")
             try:
                 value = decrypt_bytes(row["envelope"], object_id.encode()).decode()
             except Exception:
                 append_audit(cur, p.subject, "decryption_failed", object_id)
-                raise HTTPException(409, "Ciphertext integrity verification failed")
+                _security_raise(cur, 409, "Ciphertext integrity verification failed")
             append_audit(cur, p.subject, "object_read", object_id)
             profile = row.get("protection_profile") or "VAULT-ENVELOPE"
             return {
@@ -334,32 +335,66 @@ def _validate_scif_device_jwk(jwk: dict) -> dict:
     return {"kty": "EC", "crv": "P-256", "x": jwk["x"], "y": jwk["y"], "ext": True}
 
 
-def _verify_scif_device_proof(request: Request, row) -> None:
-    jwk = row.get("device_public_jwk")
-    if not jwk:
-        raise HTTPException(401, "SCIF session requires cryptographic device re-entry")
-    timestamp = request.headers.get("x-ung-scif-time", "")
-    signature_text = request.headers.get("x-ung-scif-proof", "")
+def _verify_scif_device_proof(cur, request: Request, row) -> None:
     try:
-        ts = int(timestamp)
-    except Exception:
-        raise HTTPException(401, "SCIF device proof timestamp required")
-    now_s = int(utcnow().timestamp())
-    if abs(now_s - ts) > 30:
-        raise HTTPException(401, "SCIF device proof is stale")
-    canonical = f"{request.method.upper()}\n{request.url.path}\n{timestamp}\n{row['id']}".encode("utf-8")
-    try:
+        jwk = row.get("device_public_jwk")
+        if not jwk:
+            raise HTTPException(401, "SCIF session requires cryptographic device re-entry")
+        timestamp = request.headers.get("x-ung-scif-time", "")
+        signature_text = request.headers.get("x-ung-scif-proof", "")
+        try:
+            ts = int(timestamp)
+        except Exception:
+            raise HTTPException(401, "SCIF device proof timestamp required")
+        now_s = int(utcnow().timestamp())
+        if abs(now_s - ts) > 30:
+            raise HTTPException(401, "SCIF device proof is stale")
+        canonical = f"{request.method.upper()}\n{request.url.path}\n{timestamp}\n{row['id']}".encode("utf-8")
         x = int.from_bytes(_b64url_decode(jwk["x"]), "big")
         y = int.from_bytes(_b64url_decode(jwk["y"]), "big")
         pub = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
         raw = _b64url_decode(signature_text)
         if len(raw) != 64:
-            raise ValueError("bad signature length")
-        r = int.from_bytes(raw[:32], "big")
-        s = int.from_bytes(raw[32:], "big")
-        pub.verify(encode_dss_signature(r, s), canonical, ec.ECDSA(hashes.SHA256()))
-    except Exception as exc:
-        raise HTTPException(403, "SCIF cryptographic device proof failed") from exc
+            raise HTTPException(403, "SCIF cryptographic device proof failed")
+        rr = int.from_bytes(raw[:32], "big")
+        ss = int.from_bytes(raw[32:], "big")
+        pub.verify(encode_dss_signature(rr, ss), canonical, ec.ECDSA(hashes.SHA256()))
+    except HTTPException as exc:
+        _clear_scif_sensitive_state(
+            cur, str(row["id"]), state="revoked", reason="cryptographic_device_proof_failed", close=True
+        )
+        append_audit(cur, row["owner"], "scif_crypto_device_proof_revoked", str(row["object_id"]), {
+            "session_id": str(row["id"]),
+            "reason": str(exc.detail),
+        })
+        _notify_sentinel(
+            severity="critical",
+            title="Digital SCIF cryptographic device proof failed",
+            event_type="scif_crypto_device_proof_failed",
+            details=str(exc.detail),
+            session_id=str(row["id"]),
+            object_id=str(row["object_id"]),
+            owner=row["owner"],
+        )
+        _security_raise(cur, exc.status_code, str(exc.detail))
+    except Exception:
+        _clear_scif_sensitive_state(
+            cur, str(row["id"]), state="revoked", reason="cryptographic_device_proof_failed", close=True
+        )
+        append_audit(cur, row["owner"], "scif_crypto_device_proof_revoked", str(row["object_id"]), {
+            "session_id": str(row["id"]),
+            "reason": "signature verification failed",
+        })
+        _notify_sentinel(
+            severity="critical",
+            title="Digital SCIF cryptographic device proof failed",
+            event_type="scif_crypto_device_proof_failed",
+            details="signature verification failed",
+            session_id=str(row["id"]),
+            object_id=str(row["object_id"]),
+            owner=row["owner"],
+        )
+        _security_raise(cur, 403, "SCIF cryptographic device proof failed")
 
 
 def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str = "", session_id: str | None = None, object_id: str | None = None, owner: str | None = None) -> bool:
@@ -946,7 +981,7 @@ def render_scif_document(
                 cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
-            _verify_scif_device_proof(request, row)
+            _verify_scif_device_proof(cur, request, row)
             try:
                 value = decrypt_bytes(row["envelope"], str(row["object_id"]).encode()).decode()
                 pixels = render_scif_image(
@@ -1013,7 +1048,7 @@ def scif_heartbeat(
                 cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
-            _verify_scif_device_proof(request, row)
+            _verify_scif_device_proof(cur, request, row)
             return Response(
                 content=json.dumps({"active": True, "verified_at": utcnow().isoformat()}),
                 media_type="application/json",
