@@ -244,3 +244,12 @@ VAULT no longer needs to retain the user's full JANUS bearer token for continuou
 - VAULT encrypts that narrower handle inside the SCIF session record and uses it for continuous introspection.
 - The handle is valid only while the parent JANUS session remains valid and while the short SCIF-handle TTL has not expired.
 - This reduces the impact of a VAULT database compromise compared with storing a reusable full-session bearer token.
+
+
+### Mandatory SCIF plaintext boundary
+Restricted and top-secret VAULT objects can no longer be retrieved as ordinary browser plaintext.
+
+- Direct `GET /vault/objects/{id}` access is blocked for `restricted` and `top_secret` objects even when the caller otherwise has clearance.
+- Those classifications must be viewed through the Digital SCIF flow, where fresh MFA, trusted-device checks, session controls, continuous JANUS authorization and server-side rasterization are enforced.
+- Every blocked direct-plaintext attempt is written to the VAULT audit chain.
+- Lower-classification objects keep the normal retrieval path.
