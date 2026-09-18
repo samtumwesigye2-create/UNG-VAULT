@@ -166,3 +166,14 @@ Active Digital SCIF sessions also enforce an inactivity lock.
 - If the viewer stops heartbeating beyond the idle window, VAULT changes the session to `locked`, destroys the encrypted JANUS authorization envelope, and clears the device binding.
 - A locked session cannot expose plaintext. The original owner must explicitly re-enter, passing current JANUS, MFA, trusted-device, clearance, compartment and device-binding checks again.
 - Absolute session expiry still applies; re-entry never extends the original expiration time.
+
+
+### Rotating SCIF browser secret
+SCIF entry tokens and active browser-session secrets are separated.
+
+- The original SCIF entry token is used only to authorize entry or re-entry.
+- Each successful entry generates a new random browser-only SCIF secret.
+- VAULT stores only the SHA-256 hash of that browser secret and places the secret in the secure HttpOnly SCIF cookie.
+- View and heartbeat requests validate the rotated browser secret, not the reusable entry token.
+- Re-entry rotates the browser secret again, invalidating any previously copied SCIF cookie.
+- Lock, revoke, close and expiry destroy the browser-secret hash.
