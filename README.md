@@ -87,3 +87,15 @@ Security notes:
 - Sender should deliver the code through a separate channel from the file.
 - Wrong-code attempts fail authentication and are audit-logged.
 - Redaction remains irreversible; the full view comes from decrypting the separately encrypted original embedded in the package, not from reversing redaction.
+
+
+## Full-file encryption bypass
+Selective redaction is optional. UNG-VAULT always keeps a direct full-file encryption path that applies **no redaction at all**.
+
+- UI: choose **Full encryption only — no redaction**.
+- API: use `POST /vault/files/encrypt`.
+- Output: a normal `.ungvault` encrypted package containing the complete original.
+- The redaction percentage is ignored because no redaction step runs.
+- Decryption uses the existing authenticated `POST /vault/files/decrypt` workflow.
+
+This guarantees that redaction never replaces or blocks VAULT's original full-file encryption capability.
