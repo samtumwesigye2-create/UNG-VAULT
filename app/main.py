@@ -1,7 +1,7 @@
 import json, uuid, os, hashlib, secrets
 from pathlib import Path
 from urllib.parse import urlsplit, quote
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie, Header
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie, Header, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from .auth import Principal, authorize, require_principal, principal_from_authorization
@@ -260,6 +260,64 @@ def get_document_markings(profile_code: str, document_id: str, p: Principal = De
         "print": print_marking(profile_code, document_id),
     }
 
+def _janus_device_claim(p: Principal) -> str:
+    for key in ("device_id", "device", "device_uuid", "trusted_device_id"):
+        value = p.claims.get(key)
+        if isinstance(value, (str, int)) and str(value):
+            return str(value)
+    return ""
+
+
+def _request_device_binding(request: Request, janus_device: str) -> str:
+    # Bind to the trusted JANUS device identity when available and to stable
+    # browser/device signals. Deliberately exclude IP so roaming/VPN changes
+    # do not terminate a legitimate SCIF session.
+    pieces = [
+        janus_device,
+        request.headers.get("user-agent", ""),
+        request.headers.get("sec-ch-ua", ""),
+        request.headers.get("sec-ch-ua-platform", ""),
+        request.headers.get("accept-language", ""),
+    ]
+    return hashlib.sha256("\n".join(pieces).encode("utf-8")).hexdigest()
+
+
+def _enforce_device_binding(cur, row, request: Request, current: Principal | None = None):
+    expected = row.get("device_binding_hash")
+    if not expected:
+        raise HTTPException(401, "SCIF session requires device-bound re-entry")
+    principal = current
+    if principal is None:
+        envelope = row.get("auth_envelope")
+        if not envelope:
+            raise HTTPException(401, "SCIF session requires re-entry")
+        authorization = decrypt_bytes(envelope, str(row["id"]).encode()).decode("utf-8")
+        principal = principal_from_authorization(authorization)
+    current_claim = _janus_device_claim(principal)
+    stored_claim = row.get("device_claim") or ""
+    if stored_claim and current_claim and not secrets.compare_digest(stored_claim, current_claim):
+        cur.execute(
+            "UPDATE vault_scif_sessions SET state='revoked',closed_at=COALESCE(closed_at,now()),revoked_reason='device_identity_changed',auth_envelope=NULL WHERE id=%s",
+            (str(row["id"]),),
+        )
+        append_audit(cur, row["owner"], "scif_device_binding_revoked", str(row["object_id"]), {
+            "session_id": str(row["id"]),
+            "reason": "JANUS device identity changed",
+        })
+        raise HTTPException(403, "SCIF device identity changed")
+    actual = _request_device_binding(request, current_claim or stored_claim)
+    if not secrets.compare_digest(expected, actual):
+        cur.execute(
+            "UPDATE vault_scif_sessions SET state='revoked',closed_at=COALESCE(closed_at,now()),revoked_reason='device_binding_mismatch',auth_envelope=NULL WHERE id=%s",
+            (str(row["id"]),),
+        )
+        append_audit(cur, row["owner"], "scif_device_binding_revoked", str(row["object_id"]), {
+            "session_id": str(row["id"]),
+            "reason": "request device binding mismatch",
+        })
+        raise HTTPException(403, "SCIF session is bound to a different device/browser")
+
+
 def _continuous_scif_check(cur, row):
     """Re-validate the viewer against JANUS before exposing SCIF plaintext."""
     envelope = row.get("auth_envelope")
@@ -405,6 +463,7 @@ def scif_session_status(session_id: str, p: Principal = Depends(require_principa
 def enter_scif_session(
     req: ScifEnterRequest,
     session_id: str,
+    request: Request,
     p: Principal = Depends(require_principal),
     authorization: str = Header(None),
 ):
@@ -429,14 +488,18 @@ def enter_scif_session(
                 append_audit(cur, p.subject, "scif_enter_denied", str(row["object_id"]), {"session_id": session_id})
                 raise HTTPException(403, "Invalid SCIF session token")
             auth_envelope = encrypt_bytes(authorization.encode("utf-8"), session_id.encode())
+            device_claim = _janus_device_claim(p)
+            device_binding_hash = _request_device_binding(request, device_claim)
             cur.execute(
-                "UPDATE vault_scif_sessions SET opened_at=COALESCE(opened_at,now()),auth_envelope=%s::jsonb,last_verified_at=now(),revoked_reason=NULL WHERE id=%s",
-                (json.dumps(auth_envelope), session_id),
+                "UPDATE vault_scif_sessions SET opened_at=COALESCE(opened_at,now()),auth_envelope=%s::jsonb,last_verified_at=now(),revoked_reason=NULL,device_binding_hash=%s,device_claim=%s WHERE id=%s",
+                (json.dumps(auth_envelope), device_binding_hash, device_claim, session_id),
             )
             append_audit(cur, p.subject, "scif_entered", str(row["object_id"]), {
                 "session_id": session_id,
                 "mode": row["mode"],
                 "continuous_authorization": True,
+                "device_bound": True,
+                "janus_device_claim": bool(device_claim),
             })
     resp = Response(status_code=204)
     resp.set_cookie(
@@ -451,7 +514,11 @@ def enter_scif_session(
     return resp
 
 @app.get("/vault/scif/view/{session_id}", response_class=Response)
-def view_scif_session(session_id: str, ung_scif_session: str | None = Cookie(default=None, alias="UNG_SCIF_SESSION")):
+def view_scif_session(
+    session_id: str,
+    request: Request,
+    ung_scif_session: str | None = Cookie(default=None, alias="UNG_SCIF_SESSION"),
+):
     if not ung_scif_session or ":" not in ung_scif_session:
         raise HTTPException(401, "SCIF session cookie required")
     cookie_session, token = ung_scif_session.split(":", 1)
@@ -477,7 +544,8 @@ def view_scif_session(session_id: str, ung_scif_session: str | None = Cookie(def
             if not secrets.compare_digest(token_hash, row["token_hash"]):
                 append_audit(cur, row["owner"], "scif_view_denied", str(row["object_id"]), {"session_id": session_id})
                 raise HTTPException(403, "Invalid SCIF session")
-            _continuous_scif_check(cur, row)
+            current = _continuous_scif_check(cur, row)
+            _enforce_device_binding(cur, row, request, current)
             try:
                 value = decrypt_bytes(row["envelope"], str(row["object_id"]).encode()).decode()
             except Exception:
@@ -495,7 +563,11 @@ def view_scif_session(session_id: str, ung_scif_session: str | None = Cookie(def
             )
 
 @app.get("/vault/scif/heartbeat/{session_id}")
-def scif_heartbeat(session_id: str, ung_scif_session: str | None = Cookie(default=None, alias="UNG_SCIF_SESSION")):
+def scif_heartbeat(
+    session_id: str,
+    request: Request,
+    ung_scif_session: str | None = Cookie(default=None, alias="UNG_SCIF_SESSION"),
+):
     if not ung_scif_session or ":" not in ung_scif_session:
         raise HTTPException(401, "SCIF session cookie required")
     cookie_session, token = ung_scif_session.split(":", 1)
@@ -524,7 +596,8 @@ def scif_heartbeat(session_id: str, ung_scif_session: str | None = Cookie(defaul
             if not secrets.compare_digest(token_hash, row["token_hash"]):
                 append_audit(cur, row["owner"], "scif_heartbeat_denied", str(row["object_id"]), {"session_id": session_id})
                 raise HTTPException(403, "Invalid SCIF session")
-            _continuous_scif_check(cur, row)
+            current = _continuous_scif_check(cur, row)
+            _enforce_device_binding(cur, row, request, current)
             return Response(
                 content=json.dumps({"active": True, "verified_at": utcnow().isoformat()}),
                 media_type="application/json",
