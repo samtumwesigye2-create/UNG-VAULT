@@ -177,3 +177,12 @@ SCIF entry tokens and active browser-session secrets are separated.
 - View and heartbeat requests validate the rotated browser secret, not the reusable entry token.
 - Re-entry rotates the browser secret again, invalidating any previously copied SCIF cookie.
 - Lock, revoke, close and expiry destroy the browser-secret hash.
+
+
+### Single live SCIF session
+UNG-VAULT permits only one live Digital SCIF session per identity at a time.
+
+- Entering or re-entering a SCIF session automatically revokes any other `active` or `locked` SCIF session owned by the same identity.
+- Superseded sessions have their encrypted JANUS context, browser-secret hash, and device binding destroyed.
+- Each supersession is written to the tamper-evident audit chain with both the old and replacement session IDs.
+- Pending approval requests are not destroyed merely because another session is active; they remain subject to their original expiry and approval requirements.
