@@ -227,3 +227,11 @@ Digital SCIF sessions now track repeated authentication failures.
 - Invalid active-browser SCIF secrets are counted separately. The default limit is 3 failures, configurable with `VAULT_SCIF_MAX_COOKIE_FAILURES`.
 - Crossing either limit immediately revokes the SCIF session, destroys its live JANUS authorization context, browser secret, device binding and approval state, and records the event in the tamper-evident audit chain.
 - A successful SCIF entry resets both counters, and a valid live browser request clears accumulated cookie failures.
+
+
+### SCIF lifecycle cleanup
+Digital SCIF session exit paths now use a common sensitive-state wipe.
+
+- Expiry, explicit close, administrative revoke, device mismatch, and continuous-authorization revocation clear the encrypted JANUS context, active browser-secret hash, device binding, approvals, and authentication-failure counters.
+- The SCIF cookie lifetime is now limited to the actual remaining session lifetime instead of a fixed 120-minute browser lifetime.
+- Session-status checks include approval timestamps so fresh two-person approvals are reported correctly.
