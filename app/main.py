@@ -1,4 +1,4 @@
-import json, uuid, os, hashlib
+import json, uuid, os, hashlib, secrets
 from pathlib import Path
 from urllib.parse import urlsplit, quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie
