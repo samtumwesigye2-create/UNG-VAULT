@@ -515,6 +515,7 @@ def _record_scif_auth_failure(cur, row, *, kind: str, actor: str, action: str):
                    cookie_hash=NULL,
                    device_binding_hash=NULL,
                    device_claim=NULL,
+                   device_public_jwk=NULL,
                    approved_by='[]'::jsonb,
                    approved_at='{}'::jsonb
                WHERE id=%s""",
@@ -657,7 +658,8 @@ def _supersede_other_scif_sessions(cur, owner: str, keep_session_id: str):
                auth_envelope=NULL,
                cookie_hash=NULL,
                device_binding_hash=NULL,
-               device_claim=NULL
+               device_claim=NULL,
+               device_public_jwk=NULL
            WHERE owner=%s
              AND id<>%s
              AND state IN ('active','locked')
@@ -681,12 +683,12 @@ def _enforce_scif_idle(cur, row):
     if idle_seconds > SCIF_IDLE_SECONDS:
         if row.get("mode") == "scif_two_person":
             cur.execute(
-                "UPDATE vault_scif_sessions SET state='pending',approved_by='[]'::jsonb,approved_at='{}'::jsonb,auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,revoked_reason='idle_timeout',cookie_hash=NULL WHERE id=%s",
+                "UPDATE vault_scif_sessions SET state='pending',approved_by='[]'::jsonb,approved_at='{}'::jsonb,auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,revoked_reason='idle_timeout',cookie_hash=NULL,device_public_jwk=NULL WHERE id=%s",
                 (str(row["id"]),),
             )
         else:
             cur.execute(
-                "UPDATE vault_scif_sessions SET state='locked',auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,revoked_reason='idle_timeout',cookie_hash=NULL WHERE id=%s",
+                "UPDATE vault_scif_sessions SET state='locked',auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,revoked_reason='idle_timeout',cookie_hash=NULL,device_public_jwk=NULL WHERE id=%s",
                 (str(row["id"]),),
             )
         append_audit(cur, row["owner"], "scif_idle_locked", str(row["object_id"]), {
