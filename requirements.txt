@@ -9,3 +9,5 @@ google-cloud-kms>=3,<4
 hvac>=2.3,<3
 python-multipart>=0.0.20,<1
 pytest>=8,<9
+PyMuPDF>=1.24,<2
+Pillow>=10,<12
