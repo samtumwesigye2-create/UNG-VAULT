@@ -125,7 +125,7 @@ def scif_headers(session_id: str) -> dict[str, str]:
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
         "Permissions-Policy": "camera=(), microphone=(), geolocation=(), usb=(), clipboard-read=(), clipboard-write=()",
-        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; form-action 'none'; base-uri 'none'",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'; form-action 'none'; base-uri 'none'",
         "X-Frame-Options": "DENY",
         "X-UNG-VAULT-SCIF": session_id,
     }
