@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
@@ -18,6 +19,10 @@ SCIF_MODES = {
 
 DEFAULT_MINUTES = 30
 MAX_MINUTES = 120
+SCIF_MFA_MAX_AGE_SECONDS = max(
+    60,
+    min(1800, int(os.getenv("VAULT_SCIF_MFA_MAX_AGE_SECONDS", "300"))),
+)
 
 
 def utcnow() -> datetime:
@@ -60,6 +65,43 @@ def require_recent_mfa(p: Principal) -> None:
     if mfa is True or "mfa" in amr or "otp" in amr or "webauthn" in amr or "phishing-resistant" in acr:
         return
     raise HTTPException(403, "SCIF access requires MFA-authenticated JANUS session")
+
+
+def _claim_time(value) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        text = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def require_fresh_mfa(p: Principal, max_age_seconds: int | None = None) -> int:
+    require_recent_mfa(p)
+    max_age = max_age_seconds or SCIF_MFA_MAX_AGE_SECONDS
+
+    # Prefer an explicit MFA timestamp. OIDC auth_time is accepted as the
+    # fallback only when the same JANUS principal also proves MFA via AMR/ACR.
+    ts = (
+        _claim_time(p.claims.get("mfa_time"))
+        or _claim_time(p.claims.get("mfa_at"))
+        or _claim_time(p.claims.get("auth_time"))
+    )
+    if ts is None:
+        raise HTTPException(401, "SCIF requires fresh MFA; JANUS must provide mfa_time or auth_time")
+
+    age = int((utcnow() - ts).total_seconds())
+    if age < 0:
+        raise HTTPException(401, "Invalid JANUS MFA timestamp")
+    if age > max_age:
+        raise HTTPException(401, "SCIF MFA is stale; step-up authentication required")
+    return age
 
 
 def session_minutes(value: int) -> int:
