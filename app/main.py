@@ -270,6 +270,30 @@ def get_document_markings(profile_code: str, document_id: str, p: Principal = De
         "print": print_marking(profile_code, document_id),
     }
 
+def _clear_scif_sensitive_state(cur, session_id: str, *, state: str | None = None, reason: str | None = None, close: bool = False):
+    fields = [
+        "auth_envelope=NULL",
+        "cookie_hash=NULL",
+        "device_binding_hash=NULL",
+        "device_claim=NULL",
+        "approved_by='[]'::jsonb",
+        "approved_at='{}'::jsonb",
+        "failed_entry_attempts=0",
+        "failed_cookie_attempts=0",
+    ]
+    params = []
+    if state is not None:
+        fields.append("state=%s")
+        params.append(state)
+    if reason is not None:
+        fields.append("revoked_reason=%s")
+        params.append(reason)
+    if close:
+        fields.append("closed_at=COALESCE(closed_at,now())")
+    params.append(session_id)
+    cur.execute(f"UPDATE vault_scif_sessions SET {','.join(fields)} WHERE id=%s", tuple(params))
+
+
 def _record_scif_auth_failure(cur, row, *, kind: str, actor: str, action: str):
     if kind == "entry":
         column = "failed_entry_attempts"
@@ -593,7 +617,7 @@ def scif_session_status(session_id: str, p: Principal = Depends(require_principa
             state = row["state"]
             if row["expires_at"] <= utcnow() and state not in {"closed","revoked","expired"}:
                 state = "expired"
-                cur.execute("UPDATE vault_scif_sessions SET state='expired',auth_envelope=NULL,device_binding_hash=NULL,device_claim=NULL,cookie_hash=NULL WHERE id=%s", (session_id,))
+                _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
             return {
                 "session_id": str(row["id"]),
                 "object_id": str(row["object_id"]),
@@ -628,7 +652,7 @@ def enter_scif_session(
             if p.subject != row["owner"]:
                 raise HTTPException(403, "Only the session owner may enter this SCIF session")
             if row["expires_at"] <= utcnow():
-                cur.execute("UPDATE vault_scif_sessions SET state='expired' WHERE id=%s", (session_id,))
+                _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
                 raise HTTPException(410, "SCIF session expired")
             if row["mode"] == "scif_two_person":
                 fresh = _fresh_scif_approvals(row)
@@ -661,11 +685,12 @@ def enter_scif_session(
                 "browser_secret_rotated": True,
                 "superseded_session_count": len(superseded),
             })
+    remaining_seconds = max(1, int((row["expires_at"] - utcnow()).total_seconds()))
     resp = Response(status_code=204)
     resp.set_cookie(
         "UNG_SCIF_SESSION",
         f"{session_id}:{cookie_secret}",
-        max_age=60 * 120,
+        max_age=remaining_seconds,
         httponly=True,
         secure=True,
         samesite="strict",
@@ -697,7 +722,7 @@ def view_scif_session(
             if not row:
                 raise HTTPException(404, "SCIF session not found")
             if row["expires_at"] <= utcnow():
-                cur.execute("UPDATE vault_scif_sessions SET state='expired',closed_at=COALESCE(closed_at,now()),auth_envelope=NULL,cookie_hash=NULL WHERE id=%s", (session_id,))
+                _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
                 raise HTTPException(410, "SCIF session expired")
             _enforce_scif_idle(cur, row)
             if row["state"] != "active":
@@ -745,10 +770,7 @@ def render_scif_document(
             if not row:
                 raise HTTPException(404, "SCIF session not found")
             if row["expires_at"] <= utcnow():
-                cur.execute(
-                    "UPDATE vault_scif_sessions SET state='expired',closed_at=COALESCE(closed_at,now()),revoked_reason='expired',auth_envelope=NULL,cookie_hash=NULL WHERE id=%s",
-                    (session_id,),
-                )
+                _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
                 raise HTTPException(410, "SCIF session expired")
             _enforce_scif_idle(cur, row)
             if row["state"] != "active":
@@ -916,7 +938,7 @@ def close_scif_session(session_id: str, p: Principal = Depends(require_principal
             if p.subject != row["owner"] and "platform-admin" not in roles and "security-admin" not in roles:
                 raise HTTPException(403, "Not authorized to close this SCIF session")
             state = "revoked" if p.subject != row["owner"] else "closed"
-            cur.execute("UPDATE vault_scif_sessions SET state=%s,closed_at=now(),auth_envelope=NULL,cookie_hash=NULL WHERE id=%s", (state, session_id))
+            _clear_scif_sensitive_state(cur, session_id, state=state, reason=("administrative_revoke" if state == "revoked" else "closed"), close=True)
             append_audit(cur, p.subject, "scif_session_" + state, str(row["object_id"]), {"session_id": session_id})
     resp = Response(status_code=204)
     resp.delete_cookie("UNG_SCIF_SESSION", path="/vault/scif/")
