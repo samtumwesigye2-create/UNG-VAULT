@@ -36,8 +36,14 @@ CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   opened_at TIMESTAMPTZ,
-  closed_at TIMESTAMPTZ
+  closed_at TIMESTAMPTZ,
+  auth_envelope JSONB,
+  last_verified_at TIMESTAMPTZ,
+  revoked_reason TEXT
 );
+ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS auth_envelope JSONB;
+ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMPTZ;
+ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS revoked_reason TEXT;
 CREATE INDEX IF NOT EXISTS ix_vault_scif_sessions_owner ON vault_scif_sessions(owner, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_vault_scif_sessions_expires ON vault_scif_sessions(expires_at);
 """
