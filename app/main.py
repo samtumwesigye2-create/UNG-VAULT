@@ -37,6 +37,10 @@ class ScifSessionRequest(BaseModel):
 class ScifEnterRequest(BaseModel):
     session_token: str = Field(min_length=20, max_length=256)
 
+class ScifEmergencyRevokeRequest(BaseModel):
+    owner: str | None = Field(default=None, max_length=256)
+    reason: str = Field(min_length=3, max_length=500)
+
 class StoreRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     compartment: str = Field(min_length=1, max_length=100)
@@ -263,6 +267,21 @@ def get_document_markings(profile_code: str, document_id: str, p: Principal = De
         "pdf": pdf_marking(profile_code, document_id),
         "print": print_marking(profile_code, document_id),
     }
+
+def _require_scif_revoke_authority(p: Principal, system_wide: bool) -> None:
+    roles = {str(x) for x in p.claims.get("roles", [])}
+    permissions = {str(x) for x in p.claims.get("permissions", [])}
+    if system_wide:
+        if "platform-admin" not in roles and "vault:scif:revoke-all" not in permissions:
+            raise HTTPException(403, "System-wide SCIF revocation requires platform-admin authority")
+    elif (
+        "platform-admin" not in roles
+        and "security-admin" not in roles
+        and "vault:scif:revoke" not in permissions
+        and "vault:scif:revoke-all" not in permissions
+    ):
+        raise HTTPException(403, "SCIF revocation authority required")
+
 
 def _janus_device_claim(p: Principal) -> str:
     for key in ("device_id", "device", "device_uuid", "trusted_device_id"):
@@ -757,6 +776,73 @@ def scif_heartbeat(
                 media_type="application/json",
                 headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
             )
+
+@app.post("/vault/scif/emergency-revoke")
+def emergency_revoke_scif(
+    req: ScifEmergencyRevokeRequest,
+    p: Principal = Depends(require_principal),
+):
+    require_trusted_device(p)
+    require_fresh_mfa(p)
+    system_wide = not bool(req.owner)
+    _require_scif_revoke_authority(p, system_wide)
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if req.owner:
+                cur.execute(
+                    """UPDATE vault_scif_sessions
+                       SET state='revoked',
+                           closed_at=COALESCE(closed_at,now()),
+                           revoked_reason=%s,
+                           auth_envelope=NULL,
+                           cookie_hash=NULL,
+                           device_binding_hash=NULL,
+                           device_claim=NULL,
+                           approved_by='[]'::jsonb,
+                           approved_at='{}'::jsonb
+                       WHERE owner=%s
+                         AND state IN ('pending','active','locked')
+                       RETURNING id,object_id,owner""",
+                    (f"emergency:{req.reason}", req.owner),
+                )
+            else:
+                cur.execute(
+                    """UPDATE vault_scif_sessions
+                       SET state='revoked',
+                           closed_at=COALESCE(closed_at,now()),
+                           revoked_reason=%s,
+                           auth_envelope=NULL,
+                           cookie_hash=NULL,
+                           device_binding_hash=NULL,
+                           device_claim=NULL,
+                           approved_by='[]'::jsonb,
+                           approved_at='{}'::jsonb
+                       WHERE state IN ('pending','active','locked')
+                       RETURNING id,object_id,owner""",
+                    (f"emergency:{req.reason}",),
+                )
+            rows = cur.fetchall()
+            for row in rows:
+                append_audit(cur, p.subject, "scif_emergency_revoked", str(row["object_id"]), {
+                    "session_id": str(row["id"]),
+                    "owner": row["owner"],
+                    "scope": "owner" if req.owner else "system",
+                    "reason": req.reason,
+                })
+            append_audit(cur, p.subject, "scif_emergency_revoke_executed", detail={
+                "scope": "owner" if req.owner else "system",
+                "owner": req.owner,
+                "revoked_sessions": len(rows),
+                "reason": req.reason,
+            })
+            return {
+                "revoked_sessions": len(rows),
+                "scope": "owner" if req.owner else "system",
+                "owner": req.owner,
+                "reason": req.reason,
+            }
+
 
 @app.post("/vault/scif/sessions/{session_id}/close")
 def close_scif_session(session_id: str, p: Principal = Depends(require_principal)):
