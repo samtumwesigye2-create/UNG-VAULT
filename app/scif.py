@@ -213,14 +213,21 @@ article{{background:#0b121c;border:1px solid #263343;border-radius:12px;padding:
 </style></head>
 <body oncontextmenu="return false" ondragstart="return false">
 <header><span class="badge">SCIF MODE</span><div class="meta">{cls} • {comp} • expires {expires}</div></header>
-<main><h1>{title}</h1><article><img src="/vault/scif/render/{session_id}.png" alt="Controlled SCIF document"></article><div class="notice">Controlled viewing session. Plaintext is rasterized server-side and is not delivered as selectable HTML text. Download, print, clipboard and local caching are disabled by policy. Screen capture cannot be guaranteed by a browser; viewer/session watermarking remains active.</div></main>
+<main><h1>{title}</h1><article><img id="scif-document" alt="Controlled SCIF document"></article><div class="notice">Controlled viewing session. Plaintext is rasterized server-side and is not delivered as selectable HTML text. Download, print, clipboard and local caching are disabled by policy. Cryptographic browser-key possession is required for each render and authorization heartbeat. Screen capture cannot be guaranteed by a browser; viewer/session watermarking remains active.</div></main>
 <div class="watermark">{''.join(f'<span>{watermark}</span>' for _ in range(42))}</div>
 <script>
 document.addEventListener('copy',e=>e.preventDefault());
 document.addEventListener('cut',e=>e.preventDefault());
 document.addEventListener('paste',e=>e.preventDefault());
 document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&['p','s','c','u'].includes(e.key.toLowerCase()))e.preventDefault();}});
-const heartbeat=async()=>{{try{{const r=await fetch('/vault/scif/heartbeat/{session_id}',{{credentials:'same-origin',cache:'no-store'}});if(!r.ok)throw new Error('SCIF authorization lost')}}catch(e){{document.body.innerHTML='<main><h1>SCIF SESSION LOCKED</h1><p>Continuous authorization failed or the session was revoked.</p></main>';setTimeout(()=>location.replace('/ui'),1500)}}}};setInterval(heartbeat,15000);heartbeat();
+const sessionId='{session_id}';
+const b64url=b=>{{let s='';new Uint8Array(b).forEach(x=>s+=String.fromCharCode(x));return btoa(s).replaceAll('+','-').replaceAll('/','_').replaceAll('=','')}};
+const scifDb=()=>new Promise((ok,bad)=>{{let q=indexedDB.open('ung-vault-scif',1);q.onupgradeneeded=()=>{{let db=q.result;if(!db.objectStoreNames.contains('keys'))db.createObjectStore('keys')}};q.onsuccess=()=>ok(q.result);q.onerror=()=>bad(q.error)}});
+const scifKey=async()=>{{let db=await scifDb();return await new Promise((ok,bad)=>{{let q=db.transaction('keys').objectStore('keys').get(sessionId);q.onsuccess=()=>ok(q.result?.privateKey||null);q.onerror=()=>bad(q.error)}})}};
+const proofHeaders=async(path)=>{{let key=await scifKey();if(!key)throw new Error('SCIF device key unavailable');let ts=Math.floor(Date.now()/1000).toString(),data=new TextEncoder().encode('GET\n'+path+'\n'+ts+'\n'+sessionId),sig=await crypto.subtle.sign({{name:'ECDSA',hash:'SHA-256'}},key,data);return {{'X-UNG-SCIF-Time':ts,'X-UNG-SCIF-Proof':b64url(sig)}}}};
+const loadDocument=async()=>{{let path='/vault/scif/render/'+sessionId+'.png',h=await proofHeaders(path),r=await fetch(path,{{credentials:'same-origin',cache:'no-store',headers:h}});if(!r.ok)throw new Error('SCIF document authorization lost');let blob=await r.blob(),img=document.getElementById('scif-document'),old=img.dataset.url;if(old)URL.revokeObjectURL(old);let u=URL.createObjectURL(blob);img.dataset.url=u;img.src=u}};
+const heartbeat=async()=>{{try{{let path='/vault/scif/heartbeat/'+sessionId,h=await proofHeaders(path),r=await fetch(path,{{credentials:'same-origin',cache:'no-store',headers:h}});if(!r.ok)throw new Error('SCIF authorization lost')}}catch(e){{document.body.innerHTML='<main><h1>SCIF SESSION LOCKED</h1><p>Continuous authorization or cryptographic device proof failed.</p></main>';setTimeout(()=>location.replace('/ui'),1500)}}}};
+(async()=>{{try{{await loadDocument();await heartbeat();setInterval(heartbeat,15000)}}catch(e){{document.body.innerHTML='<main><h1>SCIF DEVICE VERIFICATION FAILED</h1><p>Re-enter this SCIF session from the VAULT portal on the authorized browser.</p></main>'}}}})();
 setTimeout(()=>location.replace('/ui'), Math.max(1000, new Date('{expires_at.isoformat()}').getTime()-Date.now()));
 </script></body></html>"""
     return HTMLResponse(page, headers=scif_headers(session_id))
