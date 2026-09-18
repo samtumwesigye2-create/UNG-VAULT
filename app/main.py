@@ -45,6 +45,7 @@ class StoreRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     compartment: str = Field(min_length=1, max_length=100)
     classification: str
+    protection_profile: str | None = None
     value: str
 
 @app.on_event("startup")
@@ -77,19 +78,35 @@ def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
             with conn.cursor() as cur:
                 append_audit(cur, p.subject, "denied_create", detail={"classification":req.classification,"compartment":req.compartment})
         raise
+    profile = req.protection_profile or "VAULT-ENVELOPE"
+    if profile not in PROFILES:
+        raise HTTPException(400, "Unknown VAULT protection profile")
     object_id = str(uuid.uuid4())
     envelope = encrypt_bytes(req.value.encode(), object_id.encode())
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO vault_objects(id,compartment,classification,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s::jsonb,%s)", (object_id,req.compartment,req.classification,req.name,json.dumps(envelope),p.subject))
-            append_audit(cur, p.subject, "object_created", object_id, {"classification":req.classification,"compartment":req.compartment})
-    return {"id":object_id,"name":req.name,"marking": marking_payload(req.classification, object_id) if req.classification in PROFILES else None}
+            cur.execute(
+                "INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
+                (object_id,req.compartment,req.classification,profile,req.name,json.dumps(envelope),p.subject),
+            )
+            append_audit(cur, p.subject, "object_created", object_id, {
+                "classification": req.classification,
+                "compartment": req.compartment,
+                "protection_profile": profile,
+            })
+    return {
+        "id": object_id,
+        "name": req.name,
+        "classification": req.classification,
+        "protection_profile": profile,
+        "marking": marking_payload(profile, object_id),
+    }
 
 @app.get("/vault/objects/{object_id}")
 def get_object(object_id: str, p: Principal = Depends(require_principal)):
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,name,compartment,classification,envelope FROM vault_objects WHERE id=%s", (object_id,))
+            cur.execute("SELECT id,name,compartment,classification,protection_profile,envelope FROM vault_objects WHERE id=%s", (object_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "Object not found")
@@ -110,7 +127,16 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
                 append_audit(cur, p.subject, "decryption_failed", object_id)
                 raise HTTPException(409, "Ciphertext integrity verification failed")
             append_audit(cur, p.subject, "object_read", object_id)
-            return {"id":str(row["id"]),"name":row["name"],"compartment":row["compartment"],"classification":row["classification"],"value":value,"marking": marking_payload(row["classification"], str(row["id"])) if row["classification"] in PROFILES else None}
+            profile = row.get("protection_profile") or "VAULT-ENVELOPE"
+            return {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "compartment": row["compartment"],
+                "classification": row["classification"],
+                "protection_profile": profile,
+                "value": value,
+                "marking": marking_payload(profile, str(row["id"])) if profile in PROFILES else None,
+            }
 
 MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 FILE_MAGIC = b"UNGVAULT1\n"
