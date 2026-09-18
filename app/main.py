@@ -69,7 +69,11 @@ def ready():
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
-        return {"ready": True}
+        return {
+            "ready": True,
+            "database": "connected",
+            "sentinel_signed_channel": _sentinel_signed_probe(),
+        }
     except Exception as e:
         raise HTTPException(503, f"not ready: {type(e).__name__}")
 
@@ -419,6 +423,34 @@ def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str
             "Content-Type": "application/json",
             "X-UNG-VAULT-Signature": signature,
         },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def _sentinel_signed_probe() -> bool:
+    if not SENTINEL_BASE_URL or not SENTINEL_INGEST_SECRET:
+        return False
+    payload = {
+        "source": "UNG-VAULT",
+        "severity": "low",
+        "title": "VAULT-SENTINEL signed channel probe",
+        "details": "",
+        "event_type": "integration_probe",
+        "session_id": None,
+        "object_id": None,
+        "owner": None,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(SENTINEL_INGEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(
+        SENTINEL_BASE_URL + "/v1/ingest/vault/probe",
+        data=raw,
+        headers={"Content-Type": "application/json", "X-UNG-VAULT-Signature": signature},
         method="POST",
     )
     try:
