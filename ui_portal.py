@@ -6,6 +6,9 @@ from fastapi import Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+class MfaCode(BaseModel):
+    code: str = Field(min_length=6,max_length=8)
+
 class Login(BaseModel):
     email: str = Field(min_length=3,max_length=254)
     password: str = Field(min_length=1,max_length=512)
@@ -27,6 +30,33 @@ def install_ui(app,page,janus_url=None):
         raise RuntimeError('UI sign-in requires a fixed HTTPS JANUS authority')
     base=janus_url.rstrip('/')
 
+    def janus_json_proxy(path, authorization, body=None, method='POST'):
+        if not authorization.lower().startswith('bearer '):
+            raise HTTPException(401,'Session required')
+        data = None if body is None else json.dumps(body).encode()
+        headers = {'Authorization':authorization,'Accept':'application/json'}
+        if data is not None:
+            headers['Content-Type']='application/json'
+        req=request.Request(base+path,data=data,headers=headers,method=method)
+        try:
+            with open_request(req) as response:
+                raw=response.read(65536)
+                payload=json.loads(raw or b'{}')
+            return JSONResponse(payload,headers={'Cache-Control':'no-store'})
+        except error.HTTPError as exc:
+            if exc.code in (400,401,403,409,423,429):
+                detail='JANUS high-assurance request denied'
+                try:
+                    body=json.loads(exc.read(65536))
+                    if isinstance(body,dict) and isinstance(body.get('detail'),str):
+                        detail=body['detail']
+                except Exception:
+                    pass
+                raise HTTPException(exc.code,detail) from None
+            raise HTTPException(503,'JANUS high-assurance service is unavailable') from None
+        except (OSError,error.URLError,ValueError):
+            raise HTTPException(503,'JANUS high-assurance service is unavailable') from None
+
     @app.post('/ui/session')
     def login(body:Login):
         req=request.Request(base+'/v1/auth/login',data=json.dumps(body.model_dump()).encode(),headers={'Content-Type':'application/json'},method='POST')
@@ -41,6 +71,18 @@ def install_ui(app,page,janus_url=None):
         except (OSError,error.URLError,ValueError):
             raise HTTPException(503,'JANUS sign-in is unavailable') from None
         return JSONResponse(payload,headers={'Cache-Control':'no-store'})
+
+    @app.post('/ui/mfa/enroll')
+    def mfa_enroll(authorization:str=Header(default='')):
+        return janus_json_proxy('/v1/auth/mfa/enroll',authorization,{})
+
+    @app.post('/ui/mfa/confirm')
+    def mfa_confirm(body:MfaCode,authorization:str=Header(default='')):
+        return janus_json_proxy('/v1/auth/mfa/confirm',authorization,body.model_dump())
+
+    @app.post('/ui/mfa/step-up')
+    def mfa_step_up(body:MfaCode,authorization:str=Header(default='')):
+        return janus_json_proxy('/v1/auth/step-up',authorization,body.model_dump())
 
     @app.delete('/ui/session')
     def logout(authorization:str=Header(default='')):
