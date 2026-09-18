@@ -73,3 +73,17 @@ multipart/form-data:
   file=<PDF/PNG/JPEG>
   percentage=<0..95>
 ```
+
+
+## Code-protected sharing packages
+VAULT can create a single `.ungshare` package containing:
+- an irreversible redacted preview at the sender-selected percentage; and
+- the complete original encrypted with AES-256-GCM under a key derived from the sender's full-access code using scrypt.
+
+The access code is never stored in the package or written to the audit log. A receiver with the matching code can use VAULT's Full-access unlock workflow to recover the exact original file. Without the code, only the redacted preview is available.
+
+Security notes:
+- Minimum access-code length: 12 characters.
+- Sender should deliver the code through a separate channel from the file.
+- Wrong-code attempts fail authentication and are audit-logged.
+- Redaction remains irreversible; the full view comes from decrypting the separately encrypted original embedded in the package, not from reversing redaction.
