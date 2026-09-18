@@ -389,9 +389,8 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
     current_claim = _janus_device_claim(principal)
     stored_claim = row.get("device_claim") or ""
     if stored_claim and current_claim and not secrets.compare_digest(stored_claim, current_claim):
-        cur.execute(
-            "UPDATE vault_scif_sessions SET state='revoked',closed_at=COALESCE(closed_at,now()),revoked_reason='device_identity_changed',auth_envelope=NULL,cookie_hash=NULL WHERE id=%s",
-            (str(row["id"]),),
+        _clear_scif_sensitive_state(
+            cur, str(row["id"]), state="revoked", reason="device_identity_changed", close=True
         )
         append_audit(cur, row["owner"], "scif_device_binding_revoked", str(row["object_id"]), {
             "session_id": str(row["id"]),
@@ -400,9 +399,8 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
         raise HTTPException(403, "SCIF device identity changed")
     actual = _request_device_binding(request, current_claim or stored_claim)
     if not secrets.compare_digest(expected, actual):
-        cur.execute(
-            "UPDATE vault_scif_sessions SET state='revoked',closed_at=COALESCE(closed_at,now()),revoked_reason='device_binding_mismatch',auth_envelope=NULL,cookie_hash=NULL WHERE id=%s",
-            (str(row["id"]),),
+        _clear_scif_sensitive_state(
+            cur, str(row["id"]), state="revoked", reason="device_binding_mismatch", close=True
         )
         append_audit(cur, row["owner"], "scif_device_binding_revoked", str(row["object_id"]), {
             "session_id": str(row["id"]),
@@ -501,9 +499,8 @@ def _continuous_scif_check(cur, row):
         # Identity/authorization failures revoke the active SCIF. Temporary JANUS
         # availability failures fail closed without permanently revoking the session.
         if exc.status_code != 503:
-            cur.execute(
-                "UPDATE vault_scif_sessions SET state='revoked',closed_at=COALESCE(closed_at,now()),revoked_reason=%s,auth_envelope=NULL,cookie_hash=NULL WHERE id=%s",
-                (str(exc.detail), str(row["id"])),
+            _clear_scif_sensitive_state(
+                cur, str(row["id"]), state="revoked", reason=str(exc.detail), close=True
             )
             append_audit(cur, row["owner"], "scif_continuous_auth_revoked", str(row["object_id"]), {
                 "session_id": str(row["id"]),
@@ -608,7 +605,7 @@ def approve_scif_session(session_id: str, p: Principal = Depends(require_princip
 def scif_session_status(session_id: str, p: Principal = Depends(require_principal)):
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,object_id,owner,mode,state,approvals_required,approved_by,expires_at,created_at,opened_at,closed_at FROM vault_scif_sessions WHERE id=%s", (session_id,))
+            cur.execute("SELECT id,object_id,owner,mode,state,approvals_required,approved_by,approved_at,expires_at,created_at,opened_at,closed_at FROM vault_scif_sessions WHERE id=%s", (session_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "SCIF session not found")
@@ -836,10 +833,7 @@ def scif_heartbeat(
             if not row:
                 raise HTTPException(404, "SCIF session not found")
             if row["expires_at"] <= utcnow():
-                cur.execute(
-                    "UPDATE vault_scif_sessions SET state='expired',closed_at=COALESCE(closed_at,now()),revoked_reason='expired',auth_envelope=NULL,cookie_hash=NULL WHERE id=%s",
-                    (session_id,),
-                )
+                _clear_scif_sensitive_state(cur, session_id, state="expired", reason="expired", close=True)
                 raise HTTPException(410, "SCIF session expired")
             _enforce_scif_idle(cur, row)
             if row["state"] != "active":
