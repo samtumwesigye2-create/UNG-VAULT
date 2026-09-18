@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import html
+import json
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Iterable
+
+from fastapi import HTTPException
+from fastapi.responses import HTMLResponse
+
+from .auth import Principal
+
+SCIF_MODES = {
+    "scif": {"label": "SCIF", "approvals_required": 0},
+    "scif_two_person": {"label": "SCIF + TWO-PERSON CONTROL", "approvals_required": 2},
+}
+
+DEFAULT_MINUTES = 30
+MAX_MINUTES = 120
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def new_session_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def require_scif_entitlement(p: Principal) -> None:
+    roles = {str(x) for x in p.claims.get("roles", [])}
+    permissions = {str(x) for x in p.claims.get("permissions", [])}
+    allowed = (
+        p.clearance == "top_secret"
+        and (
+            "platform-admin" in roles
+            or "security-admin" in roles
+            or "vault:scif" in permissions
+            or "vault:scif:enter" in permissions
+        )
+    )
+    if not allowed:
+        raise HTTPException(403, "SCIF access requires top-secret clearance and SCIF entitlement")
+
+
+def require_trusted_device(p: Principal) -> None:
+    permissions = {str(x) for x in p.claims.get("permissions", [])}
+    # JANUS deployments can assert trust either as a boolean posture claim or a permission.
+    posture = p.claims.get("device_trusted", p.claims.get("trusted_device"))
+    if posture is True or "vault:trusted-device" in permissions or "device:trusted" in permissions:
+        return
+    raise HTTPException(403, "SCIF access requires a JANUS-trusted device")
+
+
+def require_recent_mfa(p: Principal) -> None:
+    amr = {str(x).lower() for x in p.claims.get("amr", [])}
+    acr = str(p.claims.get("acr", "")).lower()
+    mfa = p.claims.get("mfa")
+    if mfa is True or "mfa" in amr or "otp" in amr or "webauthn" in amr or "phishing-resistant" in acr:
+        return
+    raise HTTPException(403, "SCIF access requires MFA-authenticated JANUS session")
+
+
+def session_minutes(value: int) -> int:
+    if value < 5 or value > MAX_MINUTES:
+        raise HTTPException(400, f"SCIF session duration must be between 5 and {MAX_MINUTES} minutes")
+    return value
+
+
+def approval_count(values: Iterable[str] | None) -> int:
+    return len({str(x) for x in (values or []) if str(x)})
+
+
+def scif_headers(session_id: str) -> dict[str, str]:
+    return {
+        "Cache-Control": "no-store, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=(), usb=(), clipboard-read=(), clipboard-write=()",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; form-action 'none'; base-uri 'none'",
+        "X-Frame-Options": "DENY",
+        "X-UNG-VAULT-SCIF": session_id,
+    }
+
+
+def render_scif_view(
+    *,
+    session_id: str,
+    viewer: str,
+    classification: str,
+    compartment: str,
+    name: str,
+    value: str,
+    expires_at: datetime,
+) -> HTMLResponse:
+    stamp = f"{viewer} • {session_id[:12]} • {utcnow().isoformat(timespec='seconds')}"
+    watermark = html.escape(stamp)
+    body = html.escape(value)
+    title = html.escape(name)
+    cls = html.escape(classification.upper())
+    comp = html.escape(compartment)
+    expires = html.escape(expires_at.isoformat(timespec="seconds"))
+
+    page = f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UNG-VAULT SCIF — {title}</title>
+<style>
+*{{box-sizing:border-box}} html,body{{margin:0;background:#05080d;color:#edf2f7;font:16px system-ui,-apple-system,sans-serif}}
+body{{min-height:100vh;user-select:none;-webkit-user-select:none}} header{{position:sticky;top:0;background:#090f18;border-bottom:1px solid #293343;padding:16px 24px;z-index:3}}
+.badge{{display:inline-block;background:#6d0013;color:#fff;padding:7px 10px;border-radius:6px;font-weight:800;letter-spacing:.08em}}
+.meta{{color:#aab6c4;margin-top:8px;font-size:13px}} main{{max-width:1000px;margin:0 auto;padding:34px 28px 100px;position:relative}}
+article{{white-space:pre-wrap;line-height:1.6;background:#0b121c;border:1px solid #263343;border-radius:12px;padding:28px;min-height:50vh}}
+.watermark{{position:fixed;inset:0;pointer-events:none;z-index:10;display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:150px;overflow:hidden;opacity:.13;transform:rotate(-18deg);font-size:18px;font-weight:800}}
+.watermark span{{display:flex;align-items:center;justify-content:center;white-space:nowrap}}
+.notice{{margin-top:18px;color:#f7c873;font-size:13px}} @media print{{body{{display:none!important}}}}
+</style></head>
+<body oncontextmenu="return false" ondragstart="return false">
+<header><span class="badge">SCIF MODE</span><div class="meta">{cls} • {comp} • expires {expires}</div></header>
+<main><h1>{title}</h1><article>{body}</article><div class="notice">Controlled viewing session. Download, print, clipboard and local caching are disabled by policy. Screen capture cannot be guaranteed by a browser; viewer/session watermarking remains active.</div></main>
+<div class="watermark">{''.join(f'<span>{watermark}</span>' for _ in range(42))}</div>
+<script>
+document.addEventListener('copy',e=>e.preventDefault());
+document.addEventListener('cut',e=>e.preventDefault());
+document.addEventListener('paste',e=>e.preventDefault());
+document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&['p','s','c','u'].includes(e.key.toLowerCase()))e.preventDefault();}});
+setTimeout(()=>location.replace('/ui'), Math.max(1000, new Date('{expires_at.isoformat()}').getTime()-Date.now()));
+</script></body></html>"""
+    return HTMLResponse(page, headers=scif_headers(session_id))
