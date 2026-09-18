@@ -110,6 +110,8 @@ MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 FILE_MAGIC = b"UNGVAULT1\n"
 SCIF_IDLE_SECONDS = max(30, min(900, int(os.getenv("VAULT_SCIF_IDLE_SECONDS", "90"))))
 SCIF_APPROVAL_TTL_SECONDS = max(60, min(900, int(os.getenv("VAULT_SCIF_APPROVAL_TTL_SECONDS", "300"))))
+SCIF_MAX_ENTRY_FAILURES = max(3, min(10, int(os.getenv("VAULT_SCIF_MAX_ENTRY_FAILURES", "5"))))
+SCIF_MAX_COOKIE_FAILURES = max(2, min(10, int(os.getenv("VAULT_SCIF_MAX_COOKIE_FAILURES", "3"))))
 
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
@@ -267,6 +269,50 @@ def get_document_markings(profile_code: str, document_id: str, p: Principal = De
         "pdf": pdf_marking(profile_code, document_id),
         "print": print_marking(profile_code, document_id),
     }
+
+def _record_scif_auth_failure(cur, row, *, kind: str, actor: str, action: str):
+    if kind == "entry":
+        column = "failed_entry_attempts"
+        limit = SCIF_MAX_ENTRY_FAILURES
+    elif kind == "cookie":
+        column = "failed_cookie_attempts"
+        limit = SCIF_MAX_COOKIE_FAILURES
+    else:
+        raise ValueError("invalid SCIF failure counter")
+
+    cur.execute(
+        f"UPDATE vault_scif_sessions SET {column}={column}+1 WHERE id=%s RETURNING {column}",
+        (str(row["id"]),),
+    )
+    attempts = int(cur.fetchone()[column])
+    append_audit(cur, actor, action, str(row["object_id"]), {
+        "session_id": str(row["id"]),
+        "attempt": attempts,
+        "limit": limit,
+    })
+    if attempts >= limit:
+        cur.execute(
+            """UPDATE vault_scif_sessions
+               SET state='revoked',
+                   closed_at=COALESCE(closed_at,now()),
+                   revoked_reason='authentication_failure_limit',
+                   auth_envelope=NULL,
+                   cookie_hash=NULL,
+                   device_binding_hash=NULL,
+                   device_claim=NULL,
+                   approved_by='[]'::jsonb,
+                   approved_at='{}'::jsonb
+               WHERE id=%s""",
+            (str(row["id"]),),
+        )
+        append_audit(cur, actor, "scif_auth_failure_limit_reached", str(row["object_id"]), {
+            "session_id": str(row["id"]),
+            "kind": kind,
+            "attempts": attempts,
+        })
+        raise HTTPException(423, "SCIF session revoked after repeated authentication failures")
+    return attempts
+
 
 def _require_scif_revoke_authority(p: Principal, system_wide: bool) -> None:
     roles = {str(x) for x in p.claims.get("roles", [])}
@@ -592,7 +638,9 @@ def enter_scif_session(
             if row["state"] not in {"active", "locked"}:
                 raise HTTPException(409, "SCIF session is not enterable")
             if not secrets.compare_digest(token_hash, row["token_hash"]):
-                append_audit(cur, p.subject, "scif_enter_denied", str(row["object_id"]), {"session_id": session_id})
+                _record_scif_auth_failure(
+                    cur, row, kind="entry", actor=p.subject, action="scif_enter_denied"
+                )
                 raise HTTPException(403, "Invalid SCIF session token")
             superseded = _supersede_other_scif_sessions(cur, p.subject, session_id)
             auth_envelope = encrypt_bytes(authorization.encode("utf-8"), session_id.encode())
@@ -601,7 +649,7 @@ def enter_scif_session(
             cookie_secret = new_session_token()
             cookie_hash = hashlib.sha256(cookie_secret.encode()).hexdigest()
             cur.execute(
-                "UPDATE vault_scif_sessions SET state='active',opened_at=COALESCE(opened_at,now()),auth_envelope=%s::jsonb,last_verified_at=now(),revoked_reason=NULL,device_binding_hash=%s,device_claim=%s,cookie_hash=%s WHERE id=%s",
+                "UPDATE vault_scif_sessions SET state='active',opened_at=COALESCE(opened_at,now()),auth_envelope=%s::jsonb,last_verified_at=now(),revoked_reason=NULL,device_binding_hash=%s,device_claim=%s,cookie_hash=%s,failed_entry_attempts=0,failed_cookie_attempts=0 WHERE id=%s",
                 (json.dumps(auth_envelope), device_binding_hash, device_claim, cookie_hash, session_id),
             )
             append_audit(cur, p.subject, "scif_entered", str(row["object_id"]), {
@@ -655,8 +703,12 @@ def view_scif_session(
             if row["state"] != "active":
                 raise HTTPException(403, "SCIF session is not active")
             if not row.get("cookie_hash") or not secrets.compare_digest(token_hash, row["cookie_hash"]):
-                append_audit(cur, row["owner"], "scif_view_denied", str(row["object_id"]), {"session_id": session_id})
+                _record_scif_auth_failure(
+                    cur, row, kind="cookie", actor=row["owner"], action="scif_view_denied"
+                )
                 raise HTTPException(403, "Invalid SCIF session")
+            if row.get("failed_cookie_attempts"):
+                cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
             append_audit(cur, row["owner"], "scif_view_shell_opened", str(row["object_id"]), {"session_id": session_id})
@@ -702,8 +754,12 @@ def render_scif_document(
             if row["state"] != "active":
                 raise HTTPException(403, "SCIF session is not active")
             if not row.get("cookie_hash") or not secrets.compare_digest(token_hash, row["cookie_hash"]):
-                append_audit(cur, row["owner"], "scif_render_denied", str(row["object_id"]), {"session_id": session_id})
+                _record_scif_auth_failure(
+                    cur, row, kind="cookie", actor=row["owner"], action="scif_render_denied"
+                )
                 raise HTTPException(403, "Invalid SCIF session")
+            if row.get("failed_cookie_attempts"):
+                cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
             try:
@@ -767,8 +823,12 @@ def scif_heartbeat(
             if row["state"] != "active":
                 raise HTTPException(403, "SCIF session is not active")
             if not row.get("cookie_hash") or not secrets.compare_digest(token_hash, row["cookie_hash"]):
-                append_audit(cur, row["owner"], "scif_heartbeat_denied", str(row["object_id"]), {"session_id": session_id})
+                _record_scif_auth_failure(
+                    cur, row, kind="cookie", actor=row["owner"], action="scif_heartbeat_denied"
+                )
                 raise HTTPException(403, "Invalid SCIF session")
+            if row.get("failed_cookie_attempts"):
+                cur.execute("UPDATE vault_scif_sessions SET failed_cookie_attempts=0 WHERE id=%s", (session_id,))
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
             return Response(
