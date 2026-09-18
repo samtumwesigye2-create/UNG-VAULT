@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS vault_objects (
   id UUID PRIMARY KEY,
   compartment TEXT NOT NULL,
   classification TEXT NOT NULL,
+  protection_profile TEXT,
   name TEXT NOT NULL,
   envelope JSONB NOT NULL,
   created_by TEXT NOT NULL,
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS vault_audit (
   entry_hash TEXT NOT NULL UNIQUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS protection_profile TEXT;
 CREATE INDEX IF NOT EXISTS ix_vault_objects_compartment ON vault_objects(compartment);
 CREATE INDEX IF NOT EXISTS ix_vault_audit_created_at ON vault_audit(created_at DESC);
 CREATE TABLE IF NOT EXISTS vault_scif_sessions (
