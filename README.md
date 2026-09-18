@@ -271,3 +271,19 @@ Critical Digital SCIF security events are forwarded to UNG-SENTINEL over a signe
 - SENTINEL verifies the signature before creating an alert.
 - Forwarded events include SCIF authentication lockout, device identity change, browser/device binding mismatch, continuous-authorization revocation, and emergency SCIF revocation.
 - SENTINEL delivery is best-effort and never blocks the underlying VAULT security action; the local tamper-evident VAULT audit chain remains authoritative.
+
+
+### Cryptographic SCIF browser-key binding
+Digital SCIF now requires proof of possession of a non-exportable browser-held P-256 private key before plaintext pixels can be rendered.
+
+- The VAULT portal generates an ECDSA P-256 key pair in Web Crypto at SCIF entry.
+- The private key is stored as a non-exportable CryptoKey in IndexedDB on the authorized browser; VAULT receives only the public JWK.
+- Every raster render and 15-second heartbeat is signed over the request method, path, timestamp and SCIF session ID.
+- VAULT verifies the signature and rejects stale proofs outside a 30-second window.
+- A failed cryptographic proof revokes the SCIF session, clears live authorization state and sends a critical event to SENTINEL.
+- Existing browser-header/device-posture checks remain additional signals; they are no longer the only device-binding mechanism.
+
+### Persistent security-state denials
+Security transitions that intentionally return an HTTP error now commit their state and audit record before the error is raised.
+
+This prevents transaction rollback from undoing lock, revoke, expiry, denial and security-audit mutations when FastAPI returns a 4xx response.
