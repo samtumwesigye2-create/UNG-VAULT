@@ -47,12 +47,14 @@ CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   device_claim TEXT,
   cookie_hash TEXT,
   failed_entry_attempts INTEGER NOT NULL DEFAULT 0,
-  failed_cookie_attempts INTEGER NOT NULL DEFAULT 0
+  failed_cookie_attempts INTEGER NOT NULL DEFAULT 0,
+  device_public_jwk JSONB
 );
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS approved_at JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS cookie_hash TEXT;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS failed_entry_attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS failed_cookie_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS device_public_jwk JSONB;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS device_binding_hash TEXT;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS device_claim TEXT;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS auth_envelope JSONB;
