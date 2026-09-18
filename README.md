@@ -196,3 +196,14 @@ The VAULT UI now includes a dedicated **SCIF MFA** screen.
 - VAULT never stores the TOTP secret; enrollment state remains in JANUS.
 - The existing JANUS bearer session is re-used for step-up, while VAULT continues to enforce MFA freshness on SCIF creation, approval, entry, view and heartbeat.
 - If MFA becomes stale, the user must perform a new step-up before SCIF access can continue.
+
+
+### Server-side SCIF rasterization
+Digital SCIF plaintext is no longer inserted into the viewer HTML.
+
+- The browser receives a controlled HTML shell plus an authenticated PNG render.
+- VAULT decrypts the protected value only on the server, then rasterizes it to pixels with session/viewer watermarking.
+- The raster endpoint repeats SCIF cookie, device-binding, JANUS authorization, clearance, compartment, MFA freshness and inactivity checks before rendering.
+- Plaintext is therefore not present as selectable DOM text or an HTML source payload.
+- Raster responses use `Cache-Control: no-store` and are served inline.
+- Browser screenshots or external photography still cannot be prevented absolutely; watermarking and audit remain the deterrent/accountability controls.
