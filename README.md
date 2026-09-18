@@ -253,3 +253,12 @@ Restricted and top-secret VAULT objects can no longer be retrieved as ordinary b
 - Those classifications must be viewed through the Digital SCIF flow, where fresh MFA, trusted-device checks, session controls, continuous JANUS authorization and server-side rasterization are enforced.
 - Every blocked direct-plaintext attempt is written to the VAULT audit chain.
 - Lower-classification objects keep the normal retrieval path.
+
+
+### Classification and protection profile are separate
+Security classification and VAULT cryptographic profile are now modeled independently.
+
+- `classification` controls clearance requirements and whether Digital SCIF is mandatory: `public`, `internal`, `confidential`, `restricted`, or `top_secret`.
+- `protection_profile` selects the VAULT protection mode and its color/document marking, such as `VAULT-ONE`, `VAULT-LEGACY`, or `VAULT-PQ`.
+- A protection profile is not treated as a clearance label, and a classification is not treated as a cryptographic mode.
+- Existing objects with no stored protection profile fall back to `VAULT-ENVELOPE` for display/marking compatibility.
