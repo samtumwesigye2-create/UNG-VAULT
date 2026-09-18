@@ -98,6 +98,12 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
             except HTTPException:
                 append_audit(cur, p.subject, "denied_read", object_id, {"classification":row["classification"],"compartment":row["compartment"]})
                 raise
+            if row["classification"] in SCIF_REQUIRED_CLASSIFICATIONS:
+                append_audit(cur, p.subject, "direct_plaintext_blocked_scif_required", object_id, {
+                    "classification": row["classification"],
+                    "compartment": row["compartment"],
+                })
+                raise HTTPException(403, "Digital SCIF required for restricted or top-secret plaintext access")
             try:
                 value = decrypt_bytes(row["envelope"], object_id.encode()).decode()
             except Exception:
@@ -112,6 +118,7 @@ SCIF_IDLE_SECONDS = max(30, min(900, int(os.getenv("VAULT_SCIF_IDLE_SECONDS", "9
 SCIF_APPROVAL_TTL_SECONDS = max(60, min(900, int(os.getenv("VAULT_SCIF_APPROVAL_TTL_SECONDS", "300"))))
 SCIF_MAX_ENTRY_FAILURES = max(3, min(10, int(os.getenv("VAULT_SCIF_MAX_ENTRY_FAILURES", "5"))))
 SCIF_MAX_COOKIE_FAILURES = max(2, min(10, int(os.getenv("VAULT_SCIF_MAX_COOKIE_FAILURES", "3"))))
+SCIF_REQUIRED_CLASSIFICATIONS = {"restricted", "top_secret"}
 
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
@@ -530,7 +537,7 @@ def create_scif_session(req: ScifSessionRequest, p: Principal = Depends(require_
             if not obj:
                 raise HTTPException(404, "Object not found")
             authorize(p, obj["classification"], obj["compartment"])
-            if obj["classification"] not in {"restricted", "top_secret"}:
+            if obj["classification"] not in SCIF_REQUIRED_CLASSIFICATIONS:
                 raise HTTPException(400, "SCIF mode is reserved for restricted or top-secret objects")
 
             session_id = str(uuid.uuid4())
