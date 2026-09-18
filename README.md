@@ -145,3 +145,14 @@ Active SCIF viewing is continuously re-authorized against JANUS rather than rely
 - If identity or authorization is revoked or changes, VAULT revokes the SCIF session and destroys the stored encrypted JANUS context.
 - If JANUS is temporarily unavailable, the viewer fails closed immediately but the session is not permanently revoked solely because of the outage.
 - Closing, revoking or expiring a session destroys the stored SCIF authorization envelope.
+
+
+### SCIF device/session binding
+Digital SCIF sessions are bound to the trusted device and browser context used at entry.
+
+- VAULT records a one-way device-binding hash at SCIF entry.
+- When JANUS exposes a trusted device identifier, that identity becomes part of the binding.
+- Stable browser/device signals are included without binding to source IP, so normal roaming and VPN changes do not automatically terminate a legitimate session.
+- Every SCIF view and 15-second heartbeat re-checks the device binding.
+- A JANUS device identity change or browser/device mismatch immediately revokes the session, destroys the encrypted SCIF authorization envelope, and writes a tamper-evident audit event.
+- Copying only the SCIF cookie/session token to a different browser or device is therefore insufficient to continue viewing.
