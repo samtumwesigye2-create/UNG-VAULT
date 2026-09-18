@@ -610,6 +610,7 @@ def scif_heartbeat(
                     (session_id,),
                 )
                 raise HTTPException(410, "SCIF session expired")
+            _enforce_scif_idle(cur, row)
             if row["state"] != "active":
                 raise HTTPException(403, "SCIF session is not active")
             if not secrets.compare_digest(token_hash, row["token_hash"]):
