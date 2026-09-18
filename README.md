@@ -186,3 +186,13 @@ UNG-VAULT permits only one live Digital SCIF session per identity at a time.
 - Superseded sessions have their encrypted JANUS context, browser-secret hash, and device binding destroyed.
 - Each supersession is written to the tamper-evident audit chain with both the old and replacement session IDs.
 - Pending approval requests are not destroyed merely because another session is active; they remain subject to their original expiry and approval requirements.
+
+
+### SCIF MFA workflow
+The VAULT UI now includes a dedicated **SCIF MFA** screen.
+
+- MFA enrollment is delegated to JANUS through same-origin VAULT proxy endpoints.
+- Users can start TOTP enrollment, confirm the authenticator with a 6-digit code, and perform fresh SCIF step-up without exposing JANUS cross-origin APIs to the browser.
+- VAULT never stores the TOTP secret; enrollment state remains in JANUS.
+- The existing JANUS bearer session is re-used for step-up, while VAULT continues to enforce MFA freshness on SCIF creation, approval, entry, view and heartbeat.
+- If MFA becomes stale, the user must perform a new step-up before SCIF access can continue.
