@@ -1,4 +1,4 @@
-import json, uuid, os, hashlib, secrets
+import json, uuid, os, hashlib, secrets, hmac, urllib.request, urllib.error
 from pathlib import Path
 from urllib.parse import urlsplit, quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie, Header, Request
@@ -145,6 +145,8 @@ SCIF_APPROVAL_TTL_SECONDS = max(60, min(900, int(os.getenv("VAULT_SCIF_APPROVAL_
 SCIF_MAX_ENTRY_FAILURES = max(3, min(10, int(os.getenv("VAULT_SCIF_MAX_ENTRY_FAILURES", "5"))))
 SCIF_MAX_COOKIE_FAILURES = max(2, min(10, int(os.getenv("VAULT_SCIF_MAX_COOKIE_FAILURES", "3"))))
 SCIF_REQUIRED_CLASSIFICATIONS = {"restricted", "top_secret"}
+SENTINEL_BASE_URL = os.getenv("SENTINEL_BASE_URL", "").rstrip("/")
+SENTINEL_INGEST_SECRET = os.getenv("SENTINEL_INGEST_SECRET", "")
 
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
@@ -303,6 +305,37 @@ def get_document_markings(profile_code: str, document_id: str, p: Principal = De
         "print": print_marking(profile_code, document_id),
     }
 
+def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str = "", session_id: str | None = None, object_id: str | None = None, owner: str | None = None) -> bool:
+    if not SENTINEL_BASE_URL or not SENTINEL_INGEST_SECRET:
+        return False
+    payload = {
+        "source": "UNG-VAULT",
+        "severity": severity,
+        "title": title,
+        "details": details,
+        "event_type": event_type,
+        "session_id": session_id,
+        "object_id": object_id,
+        "owner": owner,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(SENTINEL_INGEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(
+        SENTINEL_BASE_URL + "/v1/ingest/vault",
+        data=raw,
+        headers={
+            "Content-Type": "application/json",
+            "X-UNG-VAULT-Signature": signature,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
 def _clear_scif_sensitive_state(cur, session_id: str, *, state: str | None = None, reason: str | None = None, close: bool = False):
     fields = [
         "auth_envelope=NULL",
@@ -367,6 +400,15 @@ def _record_scif_auth_failure(cur, row, *, kind: str, actor: str, action: str):
             "kind": kind,
             "attempts": attempts,
         })
+        _notify_sentinel(
+            severity="critical",
+            title="Digital SCIF authentication failure limit reached",
+            event_type="scif_auth_failure_limit",
+            details=f"{kind} failures reached {attempts}",
+            session_id=str(row["id"]),
+            object_id=str(row["object_id"]),
+            owner=row["owner"],
+        )
         raise HTTPException(423, "SCIF session revoked after repeated authentication failures")
     return attempts
 
@@ -429,6 +471,15 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
             "session_id": str(row["id"]),
             "reason": "JANUS device identity changed",
         })
+        _notify_sentinel(
+            severity="critical",
+            title="Digital SCIF device identity changed",
+            event_type="scif_device_identity_changed",
+            details="JANUS device identity changed during an active SCIF session",
+            session_id=str(row["id"]),
+            object_id=str(row["object_id"]),
+            owner=row["owner"],
+        )
         raise HTTPException(403, "SCIF device identity changed")
     actual = _request_device_binding(request, current_claim or stored_claim)
     if not secrets.compare_digest(expected, actual):
@@ -439,6 +490,15 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
             "session_id": str(row["id"]),
             "reason": "request device binding mismatch",
         })
+        _notify_sentinel(
+            severity="high",
+            title="Digital SCIF browser/device binding mismatch",
+            event_type="scif_device_binding_mismatch",
+            details="Active SCIF request no longer matched the bound browser/device context",
+            session_id=str(row["id"]),
+            object_id=str(row["object_id"]),
+            owner=row["owner"],
+        )
         raise HTTPException(403, "SCIF session is bound to a different device/browser")
 
 
@@ -539,6 +599,15 @@ def _continuous_scif_check(cur, row):
                 "session_id": str(row["id"]),
                 "reason": str(exc.detail),
             })
+            _notify_sentinel(
+                severity="high",
+                title="Digital SCIF continuous authorization revoked",
+                event_type="scif_continuous_auth_revoked",
+                details=str(exc.detail),
+                session_id=str(row["id"]),
+                object_id=str(row["object_id"]),
+                owner=row["owner"],
+            )
         raise
     cur.execute("UPDATE vault_scif_sessions SET last_verified_at=now() WHERE id=%s", (str(row["id"]),))
     return current
@@ -947,6 +1016,13 @@ def emergency_revoke_scif(
                 "revoked_sessions": len(rows),
                 "reason": req.reason,
             })
+            _notify_sentinel(
+                severity="critical",
+                title="Digital SCIF emergency revocation executed",
+                event_type="scif_emergency_revoke",
+                details=f"scope={'owner' if req.owner else 'system'}; revoked={len(rows)}; reason={req.reason}",
+                owner=req.owner,
+            )
             return {
                 "revoked_sessions": len(rows),
                 "scope": "owner" if req.owner else "system",
