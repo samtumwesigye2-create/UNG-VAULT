@@ -125,7 +125,7 @@ document.addEventListener('copy',e=>e.preventDefault());
 document.addEventListener('cut',e=>e.preventDefault());
 document.addEventListener('paste',e=>e.preventDefault());
 document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&['p','s','c','u'].includes(e.key.toLowerCase()))e.preventDefault();}});
-const heartbeat=async()=>{try{const r=await fetch('/vault/scif/heartbeat/{session_id}',{credentials:'same-origin',cache:'no-store'});if(!r.ok)throw new Error('SCIF authorization lost')}catch(e){document.body.innerHTML='<main><h1>SCIF SESSION LOCKED</h1><p>Continuous authorization failed or the session was revoked.</p></main>';setTimeout(()=>location.replace('/ui'),1500)}};setInterval(heartbeat,15000);heartbeat();
+const heartbeat=async()=>{{try{{const r=await fetch('/vault/scif/heartbeat/{session_id}',{{credentials:'same-origin',cache:'no-store'}});if(!r.ok)throw new Error('SCIF authorization lost')}}catch(e){{document.body.innerHTML='<main><h1>SCIF SESSION LOCKED</h1><p>Continuous authorization failed or the session was revoked.</p></main>';setTimeout(()=>location.replace('/ui'),1500)}}}};setInterval(heartbeat,15000);heartbeat();
 setTimeout(()=>location.replace('/ui'), Math.max(1000, new Date('{expires_at.isoformat()}').getTime()-Date.now()));
 </script></body></html>"""
     return HTMLResponse(page, headers=scif_headers(session_id))
