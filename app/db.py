@@ -39,8 +39,12 @@ CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   closed_at TIMESTAMPTZ,
   auth_envelope JSONB,
   last_verified_at TIMESTAMPTZ,
-  revoked_reason TEXT
+  revoked_reason TEXT,
+  device_binding_hash TEXT,
+  device_claim TEXT
 );
+ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS device_binding_hash TEXT;
+ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS device_claim TEXT;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS auth_envelope JSONB;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMPTZ;
 ALTER TABLE vault_scif_sessions ADD COLUMN IF NOT EXISTS revoked_reason TEXT;
