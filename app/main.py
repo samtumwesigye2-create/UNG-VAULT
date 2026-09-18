@@ -8,6 +8,8 @@ from .auth import Principal, authorize, require_principal
 from .audit import append_audit, verify_chain
 from .crypto import decrypt_bytes, encrypt_bytes
 from .redaction import redact_file
+from .document_markings import marking_payload, pdf_marking, print_marking
+from .access_policy import PROFILES, VAULT_DOCUMENT_COLORS
 from .share_package import build_share_package, unlock_share_package
 from .db import connect, init_db
 from .config import load_settings
@@ -56,7 +58,7 @@ def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
         with conn.cursor() as cur:
             cur.execute("INSERT INTO vault_objects(id,compartment,classification,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s::jsonb,%s)", (object_id,req.compartment,req.classification,req.name,json.dumps(envelope),p.subject))
             append_audit(cur, p.subject, "object_created", object_id, {"classification":req.classification,"compartment":req.compartment})
-    return {"id":object_id,"name":req.name}
+    return {"id":object_id,"name":req.name,"marking": marking_payload(req.classification, object_id) if req.classification in PROFILES else None}
 
 @app.get("/vault/objects/{object_id}")
 def get_object(object_id: str, p: Principal = Depends(require_principal)):
@@ -77,7 +79,7 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
                 append_audit(cur, p.subject, "decryption_failed", object_id)
                 raise HTTPException(409, "Ciphertext integrity verification failed")
             append_audit(cur, p.subject, "object_read", object_id)
-            return {"id":str(row["id"]),"name":row["name"],"compartment":row["compartment"],"classification":row["classification"],"value":value}
+            return {"id":str(row["id"]),"name":row["name"],"compartment":row["compartment"],"classification":row["classification"],"value":value,"marking": marking_payload(row["classification"], str(row["id"])) if row["classification"] in PROFILES else None}
 
 MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 FILE_MAGIC = b"UNGVAULT1\n"
@@ -213,6 +215,31 @@ async def unlock_share(
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
     })
+
+
+@app.get("/vault/profiles")
+def vault_profiles(p: Principal = Depends(require_principal)):
+    """UI registry for consistent VAULT badges and document markings."""
+    return {"profiles": [
+        {
+            "code": code,
+            "label": profile.label,
+            "minimum_tier": profile.minimum_tier.name,
+            "approvals_required": profile.approvals_required,
+            "color": VAULT_DOCUMENT_COLORS[code],
+        }
+        for code, profile in PROFILES.items()
+    ]}
+
+@app.get("/vault/markings/{profile_code}/{document_id}")
+def get_document_markings(profile_code: str, document_id: str, p: Principal = Depends(require_principal)):
+    if profile_code not in PROFILES:
+        raise HTTPException(404, "Unknown VAULT profile")
+    return {
+        "ui": marking_payload(profile_code, document_id),
+        "pdf": pdf_marking(profile_code, document_id),
+        "print": print_marking(profile_code, document_id),
+    }
 
 @app.get("/audit/verify")
 def audit_verify(p: Principal = Depends(require_principal)):
