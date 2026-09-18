@@ -72,3 +72,37 @@ def authorize(ctx: AccessContext, profile_code: str, resource_clearance: int,
     if len(independent) < profile.approvals_required:
         return False
     return True
+
+
+# Stable document visual classification. Color identifies the VAULT protection
+# profile only; access is always determined by authorize(), never by color.
+VAULT_DOCUMENT_COLORS = {
+    "VAULT-ONE": {"name": "Black", "hex": "#111111"},
+    "VAULT-ENVELOPE": {"name": "Slate", "hex": "#475569"},
+    "VAULT-SPLIT": {"name": "Burgundy", "hex": "#7F1D1D"},
+    "VAULT-DUAL": {"name": "Crimson", "hex": "#B91C1C"},
+    "VAULT-TIME": {"name": "Amber", "hex": "#B45309"},
+    "VAULT-FORWARD": {"name": "Teal", "hex": "#0F766E"},
+    "VAULT-FIELD": {"name": "Emerald", "hex": "#047857"},
+    "VAULT-STREAM": {"name": "Cyan", "hex": "#0E7490"},
+    "VAULT-MULTI": {"name": "Violet", "hex": "#6D28D9"},
+    "VAULT-COURIER": {"name": "Orange", "hex": "#C2410C"},
+    "VAULT-ERASE": {"name": "Graphite", "hex": "#374151"},
+    "VAULT-CANARY": {"name": "Yellow", "hex": "#A16207"},
+    "VAULT-PQ": {"name": "Indigo", "hex": "#4338CA"},
+    "VAULT-LEGACY": {"name": "Blue", "hex": "#1D4ED8"},
+    "VAULT-CASCADE": {"name": "Purple", "hex": "#7E22CE"},
+    "VAULT-TRANSIT": {"name": "Green", "hex": "#15803D"},
+}
+
+def document_marking(profile_code: str) -> dict:
+    profile = PROFILES[profile_code]
+    color = VAULT_DOCUMENT_COLORS[profile_code]
+    return {
+        "profile": profile.code,
+        "label": profile.label,
+        "color_name": color["name"],
+        "color_hex": color["hex"],
+        # Text remains authoritative for printing, accessibility and monochrome copies.
+        "banner": f"{profile.code} | {profile.label}",
+    }
