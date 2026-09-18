@@ -207,3 +207,14 @@ Digital SCIF plaintext is no longer inserted into the viewer HTML.
 - Plaintext is therefore not present as selectable DOM text or an HTML source payload.
 - Raster responses use `Cache-Control: no-store` and are served inline.
 - Browser screenshots or external photography still cannot be prevented absolutely; watermarking and audit remain the deterrent/accountability controls.
+
+
+### Emergency SCIF revocation
+UNG-VAULT includes an emergency Digital SCIF kill switch.
+
+- Targeted revocation terminates every pending, active or locked SCIF session for a specified owner identity.
+- System-wide revocation terminates every pending, active or locked SCIF session and requires platform-admin or explicit `vault:scif:revoke-all` authority.
+- Targeted revocation permits platform-admin, security-admin, or explicit SCIF revocation permission.
+- Fresh MFA and a JANUS-trusted device are required before the kill switch can run.
+- Revocation destroys encrypted JANUS context, browser-secret hashes, device bindings, and approval state.
+- Every affected session plus the overall emergency action is written to the tamper-evident VAULT audit chain with the supplied reason.
