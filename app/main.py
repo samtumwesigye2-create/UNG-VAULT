@@ -319,6 +319,32 @@ def _enforce_device_binding(cur, row, request: Request, current: Principal | Non
         raise HTTPException(403, "SCIF session is bound to a different device/browser")
 
 
+def _supersede_other_scif_sessions(cur, owner: str, keep_session_id: str):
+    """Allow only one live SCIF session per identity at a time."""
+    cur.execute(
+        """UPDATE vault_scif_sessions
+           SET state='revoked',
+               closed_at=COALESCE(closed_at,now()),
+               revoked_reason='superseded_by_new_scif_session',
+               auth_envelope=NULL,
+               cookie_hash=NULL,
+               device_binding_hash=NULL,
+               device_claim=NULL
+           WHERE owner=%s
+             AND id<>%s
+             AND state IN ('active','locked')
+           RETURNING id,object_id""",
+        (owner, keep_session_id),
+    )
+    rows = cur.fetchall()
+    for old in rows:
+        append_audit(cur, owner, "scif_session_superseded", str(old["object_id"]), {
+            "old_session_id": str(old["id"]),
+            "replacement_session_id": keep_session_id,
+        })
+    return [str(x["id"]) for x in rows]
+
+
 def _enforce_scif_idle(cur, row):
     last = row.get("last_verified_at") or row.get("opened_at")
     if not last:
@@ -506,6 +532,7 @@ def enter_scif_session(
             if not secrets.compare_digest(token_hash, row["token_hash"]):
                 append_audit(cur, p.subject, "scif_enter_denied", str(row["object_id"]), {"session_id": session_id})
                 raise HTTPException(403, "Invalid SCIF session token")
+            superseded = _supersede_other_scif_sessions(cur, p.subject, session_id)
             auth_envelope = encrypt_bytes(authorization.encode("utf-8"), session_id.encode())
             device_claim = _janus_device_claim(p)
             device_binding_hash = _request_device_binding(request, device_claim)
@@ -522,6 +549,7 @@ def enter_scif_session(
                 "device_bound": True,
                 "janus_device_claim": bool(device_claim),
                 "browser_secret_rotated": True,
+                "superseded_session_count": len(superseded),
             })
     resp = Response(status_code=204)
     resp.set_cookie(
