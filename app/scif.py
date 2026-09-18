@@ -4,8 +4,12 @@ import html
 import json
 import os
 import secrets
+import textwrap
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
+
+from PIL import Image, ImageDraw, ImageFont
 
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse
@@ -127,6 +131,57 @@ def scif_headers(session_id: str) -> dict[str, str]:
     }
 
 
+def render_scif_image(
+    *,
+    value: str,
+    viewer: str,
+    session_id: str,
+    classification: str,
+    compartment: str,
+) -> bytes:
+    """Rasterize SCIF plaintext server-side so the browser receives pixels, not text."""
+    font = ImageFont.load_default()
+    margin = 48
+    line_gap = 6
+    wrap_width = 110
+    lines: list[str] = []
+    for paragraph in value.splitlines() or [""]:
+        wrapped = textwrap.wrap(
+            paragraph,
+            width=wrap_width,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        )
+        lines.extend(wrapped or [""])
+    lines = lines[:4000]
+
+    probe = Image.new("RGB", (10, 10), "white")
+    pd = ImageDraw.Draw(probe)
+    bbox = pd.textbbox((0, 0), "Ag", font=font)
+    line_h = max(16, bbox[3] - bbox[1] + line_gap)
+    width = 1400
+    height = min(50000, max(500, margin * 2 + line_h * max(1, len(lines)) + 90))
+
+    image = Image.new("RGB", (width, height), (10, 16, 24))
+    draw = ImageDraw.Draw(image)
+    y = margin
+    for line in lines:
+        if y + line_h > height - margin:
+            break
+        draw.text((margin, y), line, font=font, fill=(238, 242, 247))
+        y += line_h
+
+    stamp = f"{viewer} | {session_id[:12]} | {classification.upper()} | {compartment}"
+    stamp_w = max(220, min(width - 40, len(stamp) * 7))
+    for yy in range(70, height, 180):
+        for xx in range(-80, width, stamp_w + 90):
+            draw.text((xx, yy), stamp, font=font, fill=(52, 64, 80))
+
+    out = BytesIO()
+    image.save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
 def render_scif_view(
     *,
     session_id: str,
@@ -134,12 +189,10 @@ def render_scif_view(
     classification: str,
     compartment: str,
     name: str,
-    value: str,
     expires_at: datetime,
 ) -> HTMLResponse:
     stamp = f"{viewer} • {session_id[:12]} • {utcnow().isoformat(timespec='seconds')}"
     watermark = html.escape(stamp)
-    body = html.escape(value)
     title = html.escape(name)
     cls = html.escape(classification.upper())
     comp = html.escape(compartment)
@@ -153,14 +206,14 @@ def render_scif_view(
 body{{min-height:100vh;user-select:none;-webkit-user-select:none}} header{{position:sticky;top:0;background:#090f18;border-bottom:1px solid #293343;padding:16px 24px;z-index:3}}
 .badge{{display:inline-block;background:#6d0013;color:#fff;padding:7px 10px;border-radius:6px;font-weight:800;letter-spacing:.08em}}
 .meta{{color:#aab6c4;margin-top:8px;font-size:13px}} main{{max-width:1000px;margin:0 auto;padding:34px 28px 100px;position:relative}}
-article{{white-space:pre-wrap;line-height:1.6;background:#0b121c;border:1px solid #263343;border-radius:12px;padding:28px;min-height:50vh}}
+article{{background:#0b121c;border:1px solid #263343;border-radius:12px;padding:18px;min-height:50vh;overflow:auto}} article img{{display:block;width:100%;height:auto;border-radius:8px;pointer-events:none}}
 .watermark{{position:fixed;inset:0;pointer-events:none;z-index:10;display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:150px;overflow:hidden;opacity:.13;transform:rotate(-18deg);font-size:18px;font-weight:800}}
 .watermark span{{display:flex;align-items:center;justify-content:center;white-space:nowrap}}
 .notice{{margin-top:18px;color:#f7c873;font-size:13px}} @media print{{body{{display:none!important}}}}
 </style></head>
 <body oncontextmenu="return false" ondragstart="return false">
 <header><span class="badge">SCIF MODE</span><div class="meta">{cls} • {comp} • expires {expires}</div></header>
-<main><h1>{title}</h1><article>{body}</article><div class="notice">Controlled viewing session. Download, print, clipboard and local caching are disabled by policy. Screen capture cannot be guaranteed by a browser; viewer/session watermarking remains active.</div></main>
+<main><h1>{title}</h1><article><img src="/vault/scif/render/{session_id}.png" alt="Controlled SCIF document"></article><div class="notice">Controlled viewing session. Plaintext is rasterized server-side and is not delivered as selectable HTML text. Download, print, clipboard and local caching are disabled by policy. Screen capture cannot be guaranteed by a browser; viewer/session watermarking remains active.</div></main>
 <div class="watermark">{''.join(f'<span>{watermark}</span>' for _ in range(42))}</div>
 <script>
 document.addEventListener('copy',e=>e.preventDefault());
