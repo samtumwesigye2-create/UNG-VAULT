@@ -156,3 +156,13 @@ Digital SCIF sessions are bound to the trusted device and browser context used a
 - Every SCIF view and 15-second heartbeat re-checks the device binding.
 - A JANUS device identity change or browser/device mismatch immediately revokes the session, destroys the encrypted SCIF authorization envelope, and writes a tamper-evident audit event.
 - Copying only the SCIF cookie/session token to a different browser or device is therefore insufficient to continue viewing.
+
+
+### SCIF inactivity lock
+Active Digital SCIF sessions also enforce an inactivity lock.
+
+- Default inactivity window: 90 seconds, configurable with `VAULT_SCIF_IDLE_SECONDS` from 30 to 900 seconds.
+- The 15-second SCIF heartbeat keeps an actively viewed session alive.
+- If the viewer stops heartbeating beyond the idle window, VAULT changes the session to `locked`, destroys the encrypted JANUS authorization envelope, and clears the device binding.
+- A locked session cannot expose plaintext. The original owner must explicitly re-enter, passing current JANUS, MFA, trusted-device, clearance, compartment and device-binding checks again.
+- Absolute session expiry still applies; re-entry never extends the original expiration time.
