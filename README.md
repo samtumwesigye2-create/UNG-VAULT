@@ -55,3 +55,21 @@ If existing v1 objects must remain readable after switching to a managed KMS bac
 
 ## Production
 Use the Dockerfile or deploy the repository directly. Never commit production keys or provider credentials. Grant the VAULT runtime only encrypt/decrypt permission on the specific KMS/Transit key it needs.
+
+
+## Selective redaction
+VAULT also supports audited, irreversible sharing copies for PDF, PNG and JPEG files.
+
+- Choose a redaction level from 0% to 95%.
+- VAULT generates deterministic black redaction blocks covering approximately that percentage of each page/image.
+- PDF redaction removes underlying text/image content before export; it is not just a visual overlay.
+- Every redaction export is written to the VAULT audit chain with the selected percentage.
+- Redaction is **not encryption** and is not reversible. Keep the original protected with VAULT encryption if it must remain recoverable.
+
+Endpoint:
+```
+POST /vault/files/redact
+multipart/form-data:
+  file=<PDF/PNG/JPEG>
+  percentage=<0..95>
+```
