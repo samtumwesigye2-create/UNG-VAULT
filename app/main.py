@@ -4,7 +4,7 @@ from urllib.parse import urlsplit, quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie, Header, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from .auth import Principal, authorize, require_principal, principal_from_authorization
+from .auth import Principal, authorize, require_principal, principal_from_authorization, exchange_scif_handle
 from .audit import append_audit, verify_chain
 from .crypto import decrypt_bytes, encrypt_bytes
 from .redaction import redact_file
@@ -664,7 +664,8 @@ def enter_scif_session(
                 )
                 raise HTTPException(403, "Invalid SCIF session token")
             superseded = _supersede_other_scif_sessions(cur, p.subject, session_id)
-            auth_envelope = encrypt_bytes(authorization.encode("utf-8"), session_id.encode())
+            scif_authorization = exchange_scif_handle(authorization)
+            auth_envelope = encrypt_bytes(scif_authorization.encode("utf-8"), session_id.encode())
             device_claim = _janus_device_claim(p)
             device_binding_hash = _request_device_binding(request, device_claim)
             cookie_secret = new_session_token()
@@ -677,6 +678,7 @@ def enter_scif_session(
                 "session_id": session_id,
                 "mode": row["mode"],
                 "continuous_authorization": True,
+                "janus_scoped_handle": True,
                 "device_bound": True,
                 "janus_device_claim": bool(device_claim),
                 "browser_secret_rotated": True,
