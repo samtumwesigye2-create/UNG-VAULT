@@ -21,6 +21,7 @@ from .scif import (
     session_minutes,
     approval_count,
     render_scif_view,
+    render_scif_image,
     utcnow,
 )
 from .db import connect, init_db
@@ -639,21 +640,80 @@ def view_scif_session(
                 raise HTTPException(403, "Invalid SCIF session")
             current = _continuous_scif_check(cur, row)
             _enforce_device_binding(cur, row, request, current)
-            try:
-                value = decrypt_bytes(row["envelope"], str(row["object_id"]).encode()).decode()
-            except Exception:
-                append_audit(cur, row["owner"], "scif_decryption_failed", str(row["object_id"]), {"session_id": session_id})
-                raise HTTPException(409, "Ciphertext integrity verification failed")
-            append_audit(cur, row["owner"], "scif_object_viewed", str(row["object_id"]), {"session_id": session_id})
+            append_audit(cur, row["owner"], "scif_view_shell_opened", str(row["object_id"]), {"session_id": session_id})
             return render_scif_view(
                 session_id=session_id,
                 viewer=row["owner"],
                 classification=row["classification"],
                 compartment=row["compartment"],
                 name=row["name"],
-                value=value,
                 expires_at=row["expires_at"],
             )
+
+@app.get("/vault/scif/render/{session_id}.png")
+def render_scif_document(
+    session_id: str,
+    request: Request,
+    ung_scif_session: str | None = Cookie(default=None, alias="UNG_SCIF_SESSION"),
+):
+    if not ung_scif_session or ":" not in ung_scif_session:
+        raise HTTPException(401, "SCIF session cookie required")
+    cookie_session, token = ung_scif_session.split(":", 1)
+    if cookie_session != session_id:
+        raise HTTPException(403, "SCIF session mismatch")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT s.*,o.name,o.compartment,o.classification,o.envelope
+                   FROM vault_scif_sessions s JOIN vault_objects o ON o.id=s.object_id
+                   WHERE s.id=%s FOR UPDATE""",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SCIF session not found")
+            if row["expires_at"] <= utcnow():
+                cur.execute(
+                    "UPDATE vault_scif_sessions SET state='expired',closed_at=COALESCE(closed_at,now()),revoked_reason='expired',auth_envelope=NULL,cookie_hash=NULL WHERE id=%s",
+                    (session_id,),
+                )
+                raise HTTPException(410, "SCIF session expired")
+            _enforce_scif_idle(cur, row)
+            if row["state"] != "active":
+                raise HTTPException(403, "SCIF session is not active")
+            if not row.get("cookie_hash") or not secrets.compare_digest(token_hash, row["cookie_hash"]):
+                append_audit(cur, row["owner"], "scif_render_denied", str(row["object_id"]), {"session_id": session_id})
+                raise HTTPException(403, "Invalid SCIF session")
+            current = _continuous_scif_check(cur, row)
+            _enforce_device_binding(cur, row, request, current)
+            try:
+                value = decrypt_bytes(row["envelope"], str(row["object_id"]).encode()).decode()
+                pixels = render_scif_image(
+                    value=value,
+                    viewer=row["owner"],
+                    session_id=session_id,
+                    classification=row["classification"],
+                    compartment=row["compartment"],
+                )
+            except HTTPException:
+                raise
+            except Exception:
+                append_audit(cur, row["owner"], "scif_render_failed", str(row["object_id"]), {"session_id": session_id})
+                raise HTTPException(409, "SCIF document render failed")
+            append_audit(cur, row["owner"], "scif_document_rasterized", str(row["object_id"]), {"session_id": session_id})
+            return Response(
+                pixels,
+                media_type="image/png",
+                headers={
+                    "Cache-Control": "no-store, max-age=0",
+                    "Pragma": "no-cache",
+                    "X-Content-Type-Options": "nosniff",
+                    "Content-Disposition": "inline",
+                    "X-UNG-VAULT-SCIF": session_id,
+                },
+            )
+
 
 @app.get("/vault/scif/heartbeat/{session_id}")
 def scif_heartbeat(
