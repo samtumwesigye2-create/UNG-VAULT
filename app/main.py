@@ -722,7 +722,15 @@ def deny_military_release(request_id: str, req: MilitaryReleaseDecisionRequest, 
                 "reason":req.reason,
                 "approved_by":row["approved_by"] or [],
             })
-    return {"request_id":request_id,"status":"denied","denied_by":p.subject,"reason":req.reason}
+    sentinel_notified=_notify_sentinel(
+        severity="medium",
+        title="VAULT-MIL redacted release denied",
+        event_type="military_release_denied",
+        details=f"Release request {request_id} denied by {p.subject}; reason: {req.reason}",
+        object_id=request_id,
+        owner=p.subject,
+    )
+    return {"request_id":request_id,"status":"denied","sentinel_notified":sentinel_notified,"denied_by":p.subject,"reason":req.reason}
 
 @app.post("/vault/military/releases/{request_id}/cancel")
 def cancel_military_release(request_id: str, req: MilitaryReleaseDecisionRequest, p: Principal = Depends(require_principal)):
@@ -776,7 +784,17 @@ def approve_military_release(request_id: str, p: Principal = Depends(require_pri
                 "status":status,
                 "requested_by":row["requested_by"],
             })
-    return {"request_id":request_id,"status":status,"approvals":len(approved),"approvals_required":required,"approved_by":approved}
+    sentinel_notified=False
+    if status=="approved":
+        sentinel_notified=_notify_sentinel(
+            severity="high",
+            title="VAULT-MIL redacted release fully approved",
+            event_type="military_release_fully_approved",
+            details=f"Release request {request_id} reached {len(approved)}/{required} approvals; final approver {p.subject}",
+            object_id=request_id,
+            owner=p.subject,
+        )
+    return {"request_id":request_id,"status":status,"sentinel_notified":sentinel_notified,"approvals":len(approved),"approvals_required":required,"approved_by":approved}
 
 @app.post("/vault/military/files/protect")
 async def military_file_protect(
@@ -887,6 +905,22 @@ async def military_file_protect(
                     "approved_by": approved,
                     "irreversible": True,
                 })
+        sentinel_notified=_notify_sentinel(
+            severity="high",
+            title="VAULT-MIL redacted military file released",
+            event_type="military_file_redacted_release",
+            details=f"{name}; tracking {tracking_number}; branch {branch}; redaction {percentage}%; release request {rid}; actor {p.subject}",
+            object_id=event_id,
+            owner=p.subject,
+        )
+        with connect() as conn:
+            with conn.cursor() as cur:
+                append_audit(cur,p.subject,"military_sentinel_delivery",event_id,{
+                    "event_type":"military_file_redacted_release",
+                    "sentinel_notified":sentinel_notified,
+                    "release_request_id":rid,
+                    "tracking_number":tracking_number,
+                })
         stem = Path(name).stem[:150] or "military-file"
         out = stem + f".mil-redacted-{percentage}" + result.suffix
         return Response(
@@ -900,6 +934,7 @@ async def military_file_protect(
                 "X-UNG-Military-Handling": f"redacted-{percentage}",
                 "X-UNG-Tracking-Number": tracking_number,
                 "X-UNG-Military-Branch": branch,
+                "X-UNG-SENTINEL-Notified": "true" if sentinel_notified else "false",
             },
         )
 
@@ -1163,8 +1198,17 @@ def transfer_military_record(object_id: str, req: MilitaryTransferRequest, reque
                 "reason": req.reason,
                 "where": origin,
             })
+    sentinel_notified=_notify_sentinel(
+        severity="medium",
+        title="VAULT-MIL military record transferred",
+        event_type="military_record_transferred",
+        details=f"{row['tracking_number']} transferred {from_branch} -> {req.to_branch}; transfer {transfer_tracking}; actor {p.subject}",
+        object_id=object_id,
+        owner=p.subject,
+    )
     return {
         "transferred": True,
+        "sentinel_notified": sentinel_notified,
         "id": object_id,
         "record_tracking_number": row["tracking_number"],
         "transfer_tracking_number": transfer_tracking,
@@ -1198,7 +1242,15 @@ def delete_military_record(object_id: str, request: Request, p: Principal = Depe
                 "record_name": row["name"],
                 "where": origin,
             })
-    return {"deleted": True, "id": object_id, "record_tracking_number": row["tracking_number"],
+    sentinel_notified=_notify_sentinel(
+        severity="high",
+        title="VAULT-MIL military record deleted",
+        event_type="military_record_deleted",
+        details=f"{row['tracking_number']} soft-deleted; delete tracking {deletion_tracking}; branch {row['military_branch']}; actor {p.subject}",
+        object_id=object_id,
+        owner=p.subject,
+    )
+    return {"deleted": True, "sentinel_notified": sentinel_notified, "id": object_id, "record_tracking_number": row["tracking_number"],
             "delete_tracking_number": deletion_tracking, "deleted_by": p.subject, "where": origin}
 
 @app.get("/vault/military/summary")
