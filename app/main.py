@@ -32,6 +32,13 @@ from .config import load_settings
 
 app = FastAPI(title="UNG-VAULT", version="1.1.0")
 PRESIDENT_INGEST_SECRET = os.getenv("PRESIDENT_INGEST_SECRET", "")
+VAULT_MIL_RECEIPT_HMAC_SECRET = os.getenv("VAULT_MIL_RECEIPT_HMAC_SECRET", "")
+
+def _sign_military_receipt(payload: dict) -> str:
+    if not VAULT_MIL_RECEIPT_HMAC_SECRET:
+        raise HTTPException(503, "Military receipt signing is not configured")
+    canonical=json.dumps(payload,sort_keys=True,separators=(",",":")).encode("utf-8")
+    return hmac.new(VAULT_MIL_RECEIPT_HMAC_SECRET.encode("utf-8"),canonical,hashlib.sha256).hexdigest()
 
 class ScifSessionRequest(BaseModel):
     object_id: str
@@ -515,7 +522,53 @@ def military_release_receipt(request_id: str, p: Principal = Depends(require_pri
     }
     canonical=json.dumps(receipt_payload,sort_keys=True,separators=(",",":")).encode("utf-8")
     receipt_payload["receipt_sha256"]=hashlib.sha256(canonical).hexdigest()
+    receipt_payload["receipt_signature_hmac_sha256"]=_sign_military_receipt(receipt_payload)
     return receipt_payload
+
+@app.get("/vault/military/releases/{request_id}/receipt/download")
+def download_military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,"Military release request not found")
+            cur.execute("""SELECT seq,actor,action,detail,created_at
+                           FROM vault_audit
+                           WHERE object_id=%s
+                           ORDER BY seq ASC""",(request_id,))
+            events=cur.fetchall()
+    receipt={
+        "request_id":request_id,
+        "status":row["status"],
+        "filename":row["file_name"],
+        "file_sha256":row["file_sha256"],
+        "military_branch":row["military_branch"],
+        "redaction_percentage":row["redaction_percentage"],
+        "reason":row["reason"],
+        "requested_by":row["requested_by"],
+        "approved_by":row["approved_by"] or [],
+        "approvals_required":PROFILES["VAULT-MIL"].approvals_required,
+        "created_at":row["created_at"].isoformat() if hasattr(row["created_at"],"isoformat") else str(row["created_at"]),
+        "expires_at":row["expires_at"].isoformat() if hasattr(row["expires_at"],"isoformat") else str(row["expires_at"]),
+        "consumed_at":row["consumed_at"].isoformat() if row["consumed_at"] and hasattr(row["consumed_at"],"isoformat") else (str(row["consumed_at"]) if row["consumed_at"] else None),
+        "events":[{
+            "seq":e["seq"],
+            "actor":e["actor"],
+            "action":e["action"],
+            "detail":e["detail"],
+            "created_at":e["created_at"].isoformat() if hasattr(e["created_at"],"isoformat") else str(e["created_at"]),
+        } for e in events],
+    }
+    canonical=json.dumps(receipt,sort_keys=True,separators=(",",":")).encode("utf-8")
+    receipt["receipt_sha256"]=hashlib.sha256(canonical).hexdigest()
+    receipt["receipt_signature_hmac_sha256"]=_sign_military_receipt(receipt)
+    body=json.dumps(receipt,indent=2,sort_keys=True).encode("utf-8")
+    return Response(body,media_type="application/json",headers={
+        "Content-Disposition":f"attachment; filename=VAULT-MIL-RECEIPT-{request_id}.json",
+        "Cache-Control":"no-store",
+        "X-Content-Type-Options":"nosniff",
+    })
 
 @app.post("/vault/military/releases/{request_id}/verify-receipt")
 def verify_military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
@@ -554,20 +607,29 @@ def verify_military_release_receipt(request_id: str, p: Principal = Depends(requ
     }
     canonical=json.dumps(receipt_payload,sort_keys=True,separators=(",",":")).encode("utf-8")
     receipt_hash=hashlib.sha256(canonical).hexdigest()
+    signed_payload=dict(receipt_payload)
+    signed_payload["receipt_sha256"]=receipt_hash
+    signature=_sign_military_receipt(signed_payload)
+    signature_ok=bool(signature)
     with connect() as conn:
         with conn.cursor() as cur:
             chain_status=verify_chain(cur)
             chain_ok=bool(chain_status.get("valid"))
+            verified=bool(chain_ok and signature_ok)
             append_audit(cur,p.subject,"military_release_receipt_verified",request_id,{
                 "receipt_sha256":receipt_hash,
+                "receipt_signature_hmac_sha256":signature,
+                "signature_valid":signature_ok,
                 "audit_chain_valid":chain_ok,
                 "broken_at_seq":chain_status.get("broken_at_seq"),
             })
     return {
         "request_id":request_id,
         "receipt_sha256":receipt_hash,
+        "receipt_signature_hmac_sha256":signature,
+        "signature_valid":signature_ok,
         "audit_chain_valid":chain_ok,
-        "verified":chain_ok,
+        "verified":verified,
         "broken_at_seq":chain_status.get("broken_at_seq"),
     }
 
