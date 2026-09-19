@@ -13,6 +13,14 @@ class Login(BaseModel):
     email: str = Field(min_length=3,max_length=254)
     password: str = Field(min_length=1,max_length=512)
 
+class RecoveryIssue(BaseModel):
+    email: str = Field(min_length=3,max_length=254)
+
+class RecoveryRedeem(BaseModel):
+    email: str = Field(min_length=3,max_length=254)
+    code: str = Field(min_length=3,max_length=128)
+    new_password: str = Field(min_length=12,max_length=512)
+
 class NoRedirect(request.HTTPRedirectHandler):
     def redirect_request(self,req,fp,code,msg,headers,newurl):return None
 
@@ -71,6 +79,38 @@ def install_ui(app,page,janus_url=None):
         except (OSError,error.URLError,ValueError):
             raise HTTPException(503,'JANUS sign-in is unavailable') from None
         return JSONResponse(payload,headers={'Cache-Control':'no-store'})
+
+    @app.post('/ui/recovery/issue')
+    def recovery_issue(body:RecoveryIssue):
+        req=request.Request(base+'/v1/auth/recovery/issue',data=json.dumps(body.model_dump()).encode(),headers={'Content-Type':'application/json','Accept':'application/json'},method='POST')
+        try:
+            with open_request(req) as response:payload=json.loads(response.read(65536))
+            return JSONResponse(payload,headers={'Cache-Control':'no-store'})
+        except error.HTTPError as exc:
+            detail='JANUS recovery request denied'
+            try:
+                body=json.loads(exc.read(65536))
+                if isinstance(body,dict) and isinstance(body.get('detail'),str):detail=body['detail']
+            except Exception:pass
+            raise HTTPException(exc.code if exc.code in (400,401,403,404,409,423,429) else 503,detail) from None
+        except (OSError,error.URLError,ValueError):
+            raise HTTPException(503,'JANUS recovery service is unavailable') from None
+
+    @app.post('/ui/recovery/redeem')
+    def recovery_redeem(body:RecoveryRedeem):
+        req=request.Request(base+'/v1/auth/recovery/redeem',data=json.dumps(body.model_dump()).encode(),headers={'Content-Type':'application/json','Accept':'application/json'},method='POST')
+        try:
+            with open_request(req) as response:payload=json.loads(response.read(65536))
+            return JSONResponse(payload,headers={'Cache-Control':'no-store'})
+        except error.HTTPError as exc:
+            detail='JANUS recovery reset denied'
+            try:
+                body=json.loads(exc.read(65536))
+                if isinstance(body,dict) and isinstance(body.get('detail'),str):detail=body['detail']
+            except Exception:pass
+            raise HTTPException(exc.code if exc.code in (400,401,403,404,409,423,429) else 503,detail) from None
+        except (OSError,error.URLError,ValueError):
+            raise HTTPException(503,'JANUS recovery service is unavailable') from None
 
     @app.post('/ui/mfa/enroll')
     def mfa_enroll(authorization:str=Header(default='')):
