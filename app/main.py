@@ -512,6 +512,16 @@ async def decrypt_file(file: UploadFile = File(...), p: Principal = Depends(requ
             raise ValueError()
         file_id = str(package["id"])
         name = _safe_name(package["filename"])
+        if package.get("format") == "UNG-VAULT-MILITARY-FILE":
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    append_audit(cur, p.subject, "military_plaintext_export_blocked", file_id, {
+                        "filename": name,
+                        "tracking_number": package.get("tracking_number"),
+                        "military_branch": package.get("military_branch"),
+                        "reason": "military files must remain encrypted or use an approved redacted release",
+                    })
+            raise HTTPException(403, "Military files cannot be exported as plaintext. Keep the file encrypted or create an approved redacted release.")
         data = decrypt_bytes(package["envelope"], file_id.encode())
     except Exception:
         with connect() as conn:
@@ -804,6 +814,7 @@ def military_summary(p: Principal = Depends(require_principal)):
         "file_events": file_events,
         "release_policy": {
             "full_encryption": True,
+            "plaintext_export_allowed": False,
             "redaction_min_percent": MILITARY_MIN_REDACTION,
             "redaction_max_percent": MILITARY_MAX_REDACTION,
             "classification_floor": "restricted",
