@@ -390,6 +390,120 @@ SENTINEL_INGEST_SECRET = os.getenv("SENTINEL_INGEST_SECRET", "")
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
 
+@app.post("/vault/military/releases/request")
+async def request_military_redacted_release(
+    file: UploadFile = File(...),
+    percentage: int = Form(...),
+    military_branch: str = Form("Joint Headquarters"),
+    reason: str = Form(...),
+    p: Principal = Depends(require_principal),
+):
+    data = await file.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
+    if percentage < MILITARY_MIN_REDACTION or percentage > MILITARY_MAX_REDACTION:
+        raise HTTPException(400, f"Military redaction must be between {MILITARY_MIN_REDACTION}% and {MILITARY_MAX_REDACTION}%")
+    branch = (military_branch or "").strip()
+    if branch not in MILITARY_BRANCHES:
+        raise HTTPException(400, "Unknown military branch")
+    reason = (reason or "").strip()
+    if len(reason) < 3:
+        raise HTTPException(400, "Release reason is required")
+    request_id = str(uuid.uuid4())
+    file_hash = hashlib.sha256(data).hexdigest()
+    expires_at = utcnow() + __import__("datetime").timedelta(minutes=30)
+    name = _safe_name(file.filename)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO military_release_requests
+                   (id,file_name,file_sha256,military_branch,redaction_percentage,reason,requested_by,approved_by,status,expires_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,'[]'::jsonb,'pending',%s)""",
+                (request_id,name,file_hash,branch,percentage,reason,p.subject,expires_at),
+            )
+            append_audit(cur,p.subject,"military_release_requested",request_id,{
+                "filename":name,
+                "file_sha256":file_hash,
+                "military_branch":branch,
+                "percentage":percentage,
+                "reason":reason,
+                "approvals_required":PROFILES["VAULT-MIL"].approvals_required,
+                "expires_at":expires_at.isoformat(),
+            })
+    return {
+        "request_id":request_id,
+        "status":"pending",
+        "filename":name,
+        "file_sha256":file_hash,
+        "military_branch":branch,
+        "percentage":percentage,
+        "reason":reason,
+        "approvals":0,
+        "approvals_required":PROFILES["VAULT-MIL"].approvals_required,
+        "expires_at":expires_at.isoformat(),
+    }
+
+@app.get("/vault/military/releases")
+def list_military_release_requests(limit: int = 50, p: Principal = Depends(require_principal)):
+    limit=max(1,min(200,int(limit)))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,file_name,military_branch,redaction_percentage,reason,requested_by,approved_by,status,expires_at,created_at,consumed_at
+                           FROM military_release_requests
+                           ORDER BY created_at DESC LIMIT %s""",(limit,))
+            rows=cur.fetchall()
+    out=[]
+    for row in rows:
+        approvals=row["approved_by"] or []
+        out.append({
+            "request_id":str(row["id"]),
+            "filename":row["file_name"],
+            "military_branch":row["military_branch"],
+            "percentage":row["redaction_percentage"],
+            "reason":row["reason"],
+            "requested_by":row["requested_by"],
+            "approved_by":approvals,
+            "approvals":len(approvals),
+            "approvals_required":PROFILES["VAULT-MIL"].approvals_required,
+            "status":row["status"],
+            "expires_at":row["expires_at"].isoformat() if hasattr(row["expires_at"],"isoformat") else str(row["expires_at"]),
+            "created_at":row["created_at"].isoformat() if hasattr(row["created_at"],"isoformat") else str(row["created_at"]),
+            "consumed_at":row["consumed_at"].isoformat() if row["consumed_at"] and hasattr(row["consumed_at"],"isoformat") else (str(row["consumed_at"]) if row["consumed_at"] else None),
+        })
+    return {"requests":out}
+
+@app.post("/vault/military/releases/{request_id}/approve")
+def approve_military_release(request_id: str, p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT * FROM military_release_requests WHERE id=%s FOR UPDATE""",(request_id,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,"Military release request not found")
+            if row["status"] not in {"pending","approved"}:
+                raise HTTPException(409,"Military release request is not approvable")
+            if row["expires_at"] <= utcnow():
+                cur.execute("UPDATE military_release_requests SET status='expired' WHERE id=%s",(request_id,))
+                append_audit(cur,p.subject,"military_release_expired",request_id)
+                raise HTTPException(409,"Military release request has expired")
+            if row["requested_by"] == p.subject:
+                raise HTTPException(403,"Requester cannot approve their own military release")
+            approved=list(row["approved_by"] or [])
+            if p.subject in approved:
+                raise HTTPException(409,"You have already approved this release")
+            approved.append(p.subject)
+            required=PROFILES["VAULT-MIL"].approvals_required
+            status="approved" if len(approved)>=required else "pending"
+            cur.execute("""UPDATE military_release_requests SET approved_by=%s::jsonb,status=%s WHERE id=%s""",
+                        (json.dumps(approved),status,request_id))
+            append_audit(cur,p.subject,"military_release_approved",request_id,{
+                "approval_number":len(approved),
+                "approvals_required":required,
+                "status":status,
+                "requested_by":row["requested_by"],
+            })
+    return {"request_id":request_id,"status":status,"approvals":len(approved),"approvals_required":required,"approved_by":approved}
+
 @app.post("/vault/military/files/protect")
 async def military_file_protect(
     file: UploadFile = File(...),
@@ -397,6 +511,7 @@ async def military_file_protect(
     percentage: int = Form(95),
     military_branch: str = Form("Joint Headquarters"),
     operation_location: str = Form("not-declared"),
+    release_request_id: str = Form(""),
     p: Principal = Depends(require_principal),
 ):
     data = await file.read(MAX_FILE_BYTES + 1)
@@ -450,12 +565,41 @@ async def military_file_protect(
     if mode == "redact":
         if percentage < MILITARY_MIN_REDACTION or percentage > MILITARY_MAX_REDACTION:
             raise HTTPException(400, f"Military redaction must be between {MILITARY_MIN_REDACTION}% and {MILITARY_MAX_REDACTION}%")
+        rid=(release_request_id or "").strip()
+        if not rid:
+            raise HTTPException(403, "Approved military release request required before creating a redacted release")
+        file_hash=hashlib.sha256(data).hexdigest()
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT * FROM military_release_requests WHERE id=%s FOR UPDATE""",(rid,))
+                release=cur.fetchone()
+                if not release:
+                    raise HTTPException(404,"Military release request not found")
+                if release["status"] != "approved":
+                    raise HTTPException(403,"Military release request does not have all required independent approvals")
+                if release["expires_at"] <= utcnow():
+                    cur.execute("UPDATE military_release_requests SET status='expired' WHERE id=%s",(rid,))
+                    append_audit(cur,p.subject,"military_release_expired",rid)
+                    raise HTTPException(409,"Military release request has expired")
+                if release["consumed_at"] is not None:
+                    raise HTTPException(409,"Military release request has already been used")
+                if release["file_sha256"] != file_hash or release["file_name"] != name:
+                    raise HTTPException(409,"Selected file does not match the approved military release request")
+                if release["military_branch"] != branch or int(release["redaction_percentage"]) != int(percentage):
+                    raise HTTPException(409,"Branch or redaction percentage does not match the approved release request")
+                approved=list(release["approved_by"] or [])
+                if len(approved) < PROFILES["VAULT-MIL"].approvals_required:
+                    raise HTTPException(403,"Military release request is missing required approvals")
         try:
             result = redact_file(data, percentage, file.content_type or "", name)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         with connect() as conn:
             with conn.cursor() as cur:
+                cur.execute("""UPDATE military_release_requests SET status='consumed',consumed_at=now()
+                               WHERE id=%s AND status='approved' AND consumed_at IS NULL""",(rid,))
+                if cur.rowcount != 1:
+                    raise HTTPException(409,"Military release authorization is no longer valid")
                 append_audit(cur, p.subject, "military_file_redacted_release", event_id, {
                     "filename": name,
                     "bytes": len(data),
@@ -464,6 +608,8 @@ async def military_file_protect(
                     "tracking_number": tracking_number,
                     "military_branch": branch,
                     "operation_location": location,
+                    "release_request_id": rid,
+                    "approved_by": approved,
                     "irreversible": True,
                 })
         stem = Path(name).stem[:150] or "military-file"
