@@ -195,19 +195,19 @@ def list_activity(limit: int = 100, p: Principal = Depends(require_principal)):
 
 @app.post("/vault/objects")
 def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
-    try:
-        authorize(p, req.classification, req.compartment)
-    except HTTPException:
-        with connect() as conn:
-            with conn.cursor() as cur:
-                append_audit(cur, p.subject, "denied_create", detail={"classification":req.classification,"compartment":req.compartment})
-        raise
     classification, profile, military = _enforce_military_object_policy(
         military_related=req.military_related,
         compartment=req.compartment,
         classification=req.classification,
         profile=req.protection_profile,
     )
+    try:
+        authorize(p, classification, req.compartment)
+    except HTTPException:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                append_audit(cur, p.subject, "denied_create", detail={"classification":classification,"compartment":req.compartment,"military_related":military})
+        raise
     if profile not in PROFILES:
         raise HTTPException(400, "Unknown VAULT protection profile")
     object_id = str(uuid.uuid4())
@@ -400,7 +400,7 @@ async def decrypt_file(file: UploadFile = File(...), p: Principal = Depends(requ
         raise HTTPException(400, "Not a UNG-VAULT encrypted file")
     try:
         package = json.loads(raw[len(FILE_MAGIC):])
-        if package.get("format") != "UNG-VAULT-FILE" or package.get("version") != 1:
+        if package.get("format") not in {"UNG-VAULT-FILE", "UNG-VAULT-MILITARY-FILE"} or package.get("version") != 1:
             raise ValueError()
         file_id = str(package["id"])
         name = _safe_name(package["filename"])
@@ -412,7 +412,8 @@ async def decrypt_file(file: UploadFile = File(...), p: Principal = Depends(requ
         raise HTTPException(409, "Encrypted file integrity verification failed")
     with connect() as conn:
         with conn.cursor() as cur:
-            append_audit(cur, p.subject, "file_decrypted", file_id, {"filename":name,"bytes":len(data)})
+            military = package.get("format") == "UNG-VAULT-MILITARY-FILE"
+            append_audit(cur, p.subject, "military_file_decrypted" if military else "file_decrypted", file_id, {"filename":name,"bytes":len(data),"profile":package.get("profile") if military else None})
     return Response(data, media_type="application/octet-stream", headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(name)}","Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
 
 @app.post("/vault/files/redact")
