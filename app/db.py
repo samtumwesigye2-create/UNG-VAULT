@@ -57,6 +57,21 @@ CREATE TABLE IF NOT EXISTS military_release_requests (
 );
 CREATE INDEX IF NOT EXISTS ix_military_release_status ON military_release_requests(status,created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_military_release_hash ON military_release_requests(file_sha256);
+CREATE TABLE IF NOT EXISTS sentinel_outbox (
+  event_id TEXT PRIMARY KEY,
+  payload JSONB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TIMESTAMPTZ,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  delivered_at TIMESTAMPTZ,
+  last_error TEXT,
+  sentinel_alert_id TEXT,
+  sentinel_incident_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_sentinel_outbox_due ON sentinel_outbox(status,next_attempt_at);
+CREATE INDEX IF NOT EXISTS ix_sentinel_outbox_created ON sentinel_outbox(created_at DESC);
 CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   id UUID PRIMARY KEY,
   object_id UUID NOT NULL REFERENCES vault_objects(id) ON DELETE CASCADE,
