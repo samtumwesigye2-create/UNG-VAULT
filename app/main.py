@@ -61,6 +61,8 @@ class StoreRequest(BaseModel):
     classification: str
     protection_profile: str | None = None
     military_related: bool = False
+    military_branch: str | None = Field(default=None, max_length=100)
+    operation_location: str | None = Field(default=None, max_length=160)
     value: str
 
 @app.on_event("startup")
@@ -199,7 +201,7 @@ def list_activity(limit: int = 100, p: Principal = Depends(require_principal)):
 
 
 @app.post("/vault/objects")
-def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
+def create_object(req: StoreRequest, request: Request, p: Principal = Depends(require_principal)):
     classification, profile, military = _enforce_military_object_policy(
         military_related=(req.military_related or _contains_military_reference(req.name) or _contains_military_reference(req.value)),
         compartment=req.compartment,
@@ -217,24 +219,41 @@ def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
         raise HTTPException(400, "Unknown VAULT protection profile")
     object_id = str(uuid.uuid4())
     envelope = encrypt_bytes(req.value.encode(), object_id.encode())
+    branch = (req.military_branch or "").strip() if military else None
+    if military and branch and branch not in MILITARY_BRANCHES:
+        raise HTTPException(400, "Unknown military branch")
+    if military and not branch:
+        branch = "Joint Headquarters"
+    tracking = _mil_tracking("MIL") if military else None
+    origin = _request_origin(request, req.operation_location)
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
-                (object_id,req.compartment,classification,profile,req.name,json.dumps(envelope),p.subject),
+                """INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by,
+                                             military_branch,tracking_number,operation_location)
+                   VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s)""",
+                (object_id,req.compartment,classification,profile,req.name,json.dumps(envelope),p.subject,
+                 branch,tracking,origin["location"]),
             )
-            append_audit(cur, p.subject, "object_created", object_id, {
+            append_audit(cur, p.subject, "military_record_created" if military else "object_created", object_id, {
+                "tracking_number": tracking,
                 "classification": classification,
                 "compartment": req.compartment,
                 "protection_profile": profile,
                 "military_related": military,
+                "military_branch": branch,
+                "where": origin,
             })
     return {
         "id": object_id,
+        "tracking_number": tracking,
         "name": req.name,
         "classification": classification,
         "protection_profile": profile,
         "military_related": military,
+        "military_branch": branch,
+        "operation_location": origin["location"],
+        "created_by": p.subject,
         "marking": marking_payload(profile, object_id),
     }
 
@@ -286,6 +305,30 @@ MILITARY_CONTENT_TERMS = (
 )
 MILITARY_MIN_REDACTION = 5
 MILITARY_MAX_REDACTION = 95
+MILITARY_BRANCHES = (
+    "Joint Headquarters",
+    "Land Forces",
+    "Air Force",
+    "Special Operations",
+    "Reserve Force",
+    "Military Intelligence",
+    "Medical Services",
+    "Logistics & Support",
+)
+
+def _mil_tracking(prefix: str = "MIL") -> str:
+    stamp = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y%m%d")
+    return f"{prefix}-{stamp}-{uuid.uuid4().hex[:12].upper()}"
+
+def _request_origin(request: Request | None, declared: str | None = None) -> dict:
+    forwarded = ""
+    ua = ""
+    host = ""
+    if request is not None:
+        forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        ua = (request.headers.get("user-agent") or "")[:240]
+        host = forwarded or (request.client.host if request.client else "")
+    return {"location": (declared or "").strip() or "not-declared", "source_ip": host or "unknown", "user_agent": ua}
 
 def _contains_military_reference(value) -> bool:
     try:
@@ -345,6 +388,7 @@ async def military_file_protect(
             "id": event_id,
             "filename": name,
             "profile": "VAULT-MIL",
+        "branches": list(MILITARY_BRANCHES),
             "classification_floor": "restricted",
             "envelope": envelope,
         }
@@ -530,11 +574,66 @@ async def unlock_share(
     })
 
 
+@app.get("/vault/military/branches")
+def military_branches(p: Principal = Depends(require_principal)):
+    return {"branches": list(MILITARY_BRANCHES)}
+
+@app.get("/vault/military/records")
+def military_records(include_deleted: bool = False, limit: int = 200, p: Principal = Depends(require_principal)):
+    limit = max(1, min(500, int(limit)))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            sql = """SELECT id,name,classification,compartment,created_by,created_at,military_branch,tracking_number,
+                            operation_location,deleted_at,deleted_by,delete_tracking_number
+                     FROM vault_objects
+                     WHERE protection_profile='VAULT-MIL'"""
+            if not include_deleted:
+                sql += " AND deleted_at IS NULL"
+            sql += " ORDER BY created_at DESC LIMIT %s"
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+    return {"records":[{
+        "id": str(r["id"]), "tracking_number": r["tracking_number"], "name": r["name"],
+        "classification": r["classification"], "compartment": r["compartment"],
+        "branch": r["military_branch"] or "Joint Headquarters",
+        "created_by": r["created_by"],
+        "created_at": r["created_at"].isoformat() if hasattr(r["created_at"],"isoformat") else str(r["created_at"]),
+        "operation_location": r["operation_location"],
+        "deleted_at": r["deleted_at"].isoformat() if r["deleted_at"] and hasattr(r["deleted_at"],"isoformat") else (str(r["deleted_at"]) if r["deleted_at"] else None),
+        "deleted_by": r["deleted_by"], "delete_tracking_number": r["delete_tracking_number"],
+    } for r in rows]}
+
+@app.delete("/vault/military/records/{object_id}")
+def delete_military_record(object_id: str, request: Request, p: Principal = Depends(require_principal)):
+    deletion_tracking = _mil_tracking("DEL")
+    origin = _request_origin(request)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,name,military_branch,tracking_number,deleted_at
+                           FROM vault_objects WHERE id=%s AND protection_profile='VAULT-MIL'""", (object_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Military record not found")
+            if row["deleted_at"] is not None:
+                raise HTTPException(409, "Military record is already deleted")
+            cur.execute("""UPDATE vault_objects
+                           SET deleted_at=now(),deleted_by=%s,delete_tracking_number=%s
+                           WHERE id=%s""", (p.subject,deletion_tracking,object_id))
+            append_audit(cur,p.subject,"military_record_deleted",object_id,{
+                "record_tracking_number": row["tracking_number"],
+                "delete_tracking_number": deletion_tracking,
+                "military_branch": row["military_branch"],
+                "record_name": row["name"],
+                "where": origin,
+            })
+    return {"deleted": True, "id": object_id, "record_tracking_number": row["tracking_number"],
+            "delete_tracking_number": deletion_tracking, "deleted_by": p.subject, "where": origin}
+
 @app.get("/vault/military/summary")
 def military_summary(p: Principal = Depends(require_principal)):
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n FROM vault_objects WHERE protection_profile='VAULT-MIL'")
+            cur.execute("SELECT COUNT(*) AS n FROM vault_objects WHERE protection_profile='VAULT-MIL' AND deleted_at IS NULL")
             protected_objects = int(cur.fetchone()["n"])
             cur.execute("""SELECT COUNT(*) AS n FROM vault_audit
                            WHERE action IN ('military_file_fully_encrypted','military_file_redacted_release','military_file_decrypted')""")
