@@ -70,6 +70,9 @@ class MilitaryTransferRequest(BaseModel):
     operation_location: str | None = Field(default=None, max_length=160)
     reason: str = Field(min_length=3, max_length=500)
 
+class MilitaryReleaseDecisionRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
 @app.on_event("startup")
 def startup():
     load_settings()
@@ -448,6 +451,9 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
     limit=max(1,min(200,int(limit)))
     with connect() as conn:
         with conn.cursor() as cur:
+            cur.execute("""UPDATE military_release_requests
+                           SET status='expired'
+                           WHERE status IN ('pending','approved') AND expires_at<=now()""")
             cur.execute("""SELECT id,file_name,military_branch,redaction_percentage,reason,requested_by,approved_by,status,expires_at,created_at,consumed_at
                            FROM military_release_requests
                            ORDER BY created_at DESC LIMIT %s""",(limit,))
@@ -471,6 +477,47 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
             "consumed_at":row["consumed_at"].isoformat() if row["consumed_at"] and hasattr(row["consumed_at"],"isoformat") else (str(row["consumed_at"]) if row["consumed_at"] else None),
         })
     return {"requests":out}
+
+@app.post("/vault/military/releases/{request_id}/deny")
+def deny_military_release(request_id: str, req: MilitaryReleaseDecisionRequest, p: Principal = Depends(require_principal)):
+    if p.clearance not in {"restricted","top_secret"}:
+        raise HTTPException(403,"Restricted clearance or higher is required to deny a military release")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT * FROM military_release_requests WHERE id=%s FOR UPDATE""",(request_id,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,"Military release request not found")
+            if row["status"] not in {"pending","approved"}:
+                raise HTTPException(409,"Military release request is not deniable")
+            if row["requested_by"] == p.subject:
+                raise HTTPException(403,"Requester cannot deny their own request; use cancel instead")
+            cur.execute("""UPDATE military_release_requests SET status='denied' WHERE id=%s""",(request_id,))
+            append_audit(cur,p.subject,"military_release_denied",request_id,{
+                "requested_by":row["requested_by"],
+                "reason":req.reason,
+                "approved_by":row["approved_by"] or [],
+            })
+    return {"request_id":request_id,"status":"denied","denied_by":p.subject,"reason":req.reason}
+
+@app.post("/vault/military/releases/{request_id}/cancel")
+def cancel_military_release(request_id: str, req: MilitaryReleaseDecisionRequest, p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT * FROM military_release_requests WHERE id=%s FOR UPDATE""",(request_id,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,"Military release request not found")
+            if row["requested_by"] != p.subject:
+                raise HTTPException(403,"Only the requester can cancel this military release request")
+            if row["status"] not in {"pending","approved"}:
+                raise HTTPException(409,"Military release request is not cancellable")
+            cur.execute("""UPDATE military_release_requests SET status='cancelled' WHERE id=%s""",(request_id,))
+            append_audit(cur,p.subject,"military_release_cancelled",request_id,{
+                "reason":req.reason,
+                "approved_by":row["approved_by"] or [],
+            })
+    return {"request_id":request_id,"status":"cancelled","cancelled_by":p.subject,"reason":req.reason}
 
 @app.post("/vault/military/releases/{request_id}/approve")
 def approve_military_release(request_id: str, p: Principal = Depends(require_principal)):
@@ -947,6 +994,11 @@ def military_summary(p: Principal = Depends(require_principal)):
                            GROUP BY COALESCE(military_branch,'Joint Headquarters')
                            ORDER BY branch""")
             branch_counts = {row["branch"]: int(row["n"]) for row in cur.fetchall()}
+            cur.execute("""UPDATE military_release_requests
+                           SET status='expired'
+                           WHERE status IN ('pending','approved') AND expires_at<=now()""")
+            cur.execute("""SELECT status,COUNT(*) AS n FROM military_release_requests GROUP BY status""")
+            release_counts = {row["status"]: int(row["n"]) for row in cur.fetchall()}
             cur.execute("""SELECT seq,actor,action,object_id,detail,created_at
                            FROM vault_audit
                            WHERE action LIKE 'military_%'
@@ -960,6 +1012,14 @@ def military_summary(p: Principal = Depends(require_principal)):
         "encrypted_files": encrypted_files,
         "redacted_releases": redacted_releases,
         "file_events": file_events,
+        "release_requests": {
+            "pending": release_counts.get("pending", 0),
+            "approved": release_counts.get("approved", 0),
+            "consumed": release_counts.get("consumed", 0),
+            "denied": release_counts.get("denied", 0),
+            "cancelled": release_counts.get("cancelled", 0),
+            "expired": release_counts.get("expired", 0),
+        },
         "release_policy": {
             "full_encryption": True,
             "plaintext_export_allowed": False,
