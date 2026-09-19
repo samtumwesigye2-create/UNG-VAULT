@@ -72,6 +72,16 @@ CREATE TABLE IF NOT EXISTS sentinel_outbox (
 );
 CREATE INDEX IF NOT EXISTS ix_sentinel_outbox_due ON sentinel_outbox(status,next_attempt_at);
 CREATE INDEX IF NOT EXISTS ix_sentinel_outbox_created ON sentinel_outbox(created_at DESC);
+CREATE TABLE IF NOT EXISTS military_receipt_signing_keys (
+  key_id TEXT PRIMARY KEY,
+  algorithm TEXT NOT NULL DEFAULT 'Ed25519',
+  public_key_b64url TEXT NOT NULL,
+  fingerprint_sha256 TEXT NOT NULL UNIQUE,
+  activated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  retired_at TIMESTAMPTZ,
+  is_active BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS ix_military_receipt_keys_active ON military_receipt_signing_keys(is_active,activated_at DESC);
 CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   id UUID PRIMARY KEY,
   object_id UUID NOT NULL REFERENCES vault_objects(id) ON DELETE CASCADE,
