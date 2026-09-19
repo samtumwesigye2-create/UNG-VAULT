@@ -1,4 +1,4 @@
-import json, uuid, os, hashlib, secrets, hmac, urllib.request, urllib.error
+import json, uuid, os, hashlib, secrets, hmac, urllib.request, urllib.error, time
 from pathlib import Path
 from urllib.parse import urlsplit, quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie, Header, Request
@@ -36,6 +36,21 @@ app = FastAPI(title="UNG-VAULT", version="1.1.0")
 PRESIDENT_INGEST_SECRET = os.getenv("PRESIDENT_INGEST_SECRET", "")
 VAULT_MIL_RECEIPT_HMAC_SECRET = os.getenv("VAULT_MIL_RECEIPT_HMAC_SECRET", "")
 VAULT_MIL_RECEIPT_ED25519_SEED_B64 = os.getenv("VAULT_MIL_RECEIPT_ED25519_SEED_B64", "")
+
+def _require_military_admin_fresh_mfa(p: Principal, action: str) -> None:
+    roles=set(map(str,p.claims.get("roles",[])))
+    if not roles.intersection({"platform-admin","security-admin"}):
+        raise HTTPException(403, f"{action} requires platform-admin or security-admin")
+    if p.claims.get("credential_kind") != "session":
+        raise HTTPException(403, f"{action} requires an interactive human JANUS session")
+    if not p.claims.get("mfa") or not p.claims.get("mfa_time"):
+        raise HTTPException(401, f"{action} requires fresh JANUS MFA step-up")
+    try:
+        age=time.time()-float(p.claims["mfa_time"])
+    except Exception:
+        raise HTTPException(401, f"{action} requires fresh JANUS MFA step-up")
+    if age < 0 or age > 300:
+        raise HTTPException(401, f"{action} requires JANUS MFA completed within the last 5 minutes")
 
 def _military_receipt_signing_key() -> Ed25519PrivateKey:
     if not VAULT_MIL_RECEIPT_ED25519_SEED_B64:
@@ -688,6 +703,7 @@ def verify_military_release_receipt(request_id: str, p: Principal = Depends(requ
 
 @app.post("/vault/military/releases/{request_id}/deny")
 def deny_military_release(request_id: str, req: MilitaryReleaseDecisionRequest, p: Principal = Depends(require_principal)):
+    _require_military_admin_fresh_mfa(p, "Military release denial")
     if p.clearance not in {"restricted","top_secret"}:
         raise HTTPException(403,"Restricted clearance or higher is required to deny a military release")
     with connect() as conn:
@@ -729,6 +745,7 @@ def cancel_military_release(request_id: str, req: MilitaryReleaseDecisionRequest
 
 @app.post("/vault/military/releases/{request_id}/approve")
 def approve_military_release(request_id: str, p: Principal = Depends(require_principal)):
+    _require_military_admin_fresh_mfa(p, "Military release approval")
     if p.clearance not in {"restricted","top_secret"}:
         raise HTTPException(403,"Restricted clearance or higher is required to approve a military release")
     with connect() as conn:
@@ -1117,6 +1134,7 @@ def military_record_history(object_id: str, p: Principal = Depends(require_princ
 
 @app.post("/vault/military/records/{object_id}/transfer")
 def transfer_military_record(object_id: str, req: MilitaryTransferRequest, request: Request, p: Principal = Depends(require_principal)):
+    _require_military_admin_fresh_mfa(p, "Military record transfer")
     if req.to_branch not in MILITARY_BRANCHES:
         raise HTTPException(400, "Unknown destination military branch")
     transfer_tracking = _mil_tracking("XFER")
@@ -1158,6 +1176,7 @@ def transfer_military_record(object_id: str, req: MilitaryTransferRequest, reque
 
 @app.delete("/vault/military/records/{object_id}")
 def delete_military_record(object_id: str, request: Request, p: Principal = Depends(require_principal)):
+    _require_military_admin_fresh_mfa(p, "Military record deletion")
     deletion_tracking = _mil_tracking("DEL")
     origin = _request_origin(request)
     with connect() as conn:
