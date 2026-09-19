@@ -41,6 +41,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_vault_objects_tracking ON vault_objects(tra
 CREATE INDEX IF NOT EXISTS ix_vault_objects_military_branch ON vault_objects(military_branch) WHERE military_branch IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_vault_objects_deleted_at ON vault_objects(deleted_at);
 CREATE INDEX IF NOT EXISTS ix_vault_audit_created_at ON vault_audit(created_at DESC);
+CREATE TABLE IF NOT EXISTS military_release_requests (
+  id UUID PRIMARY KEY,
+  file_name TEXT NOT NULL,
+  file_sha256 TEXT NOT NULL,
+  military_branch TEXT NOT NULL,
+  redaction_percentage INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  approved_by JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status TEXT NOT NULL DEFAULT 'pending',
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  consumed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS ix_military_release_status ON military_release_requests(status,created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_military_release_hash ON military_release_requests(file_sha256);
 CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   id UUID PRIMARY KEY,
   object_id UUID NOT NULL REFERENCES vault_objects(id) ON DELETE CASCADE,
