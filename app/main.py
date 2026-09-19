@@ -107,7 +107,12 @@ def ingest_president_record(
     if req.classification not in {"public", "internal", "confidential", "restricted", "top_secret"}:
         raise HTTPException(400, "invalid_classification")
     classification, protection_profile, military = _enforce_military_object_policy(
-        military_related=req.military_related,
+        military_related=(
+            req.military_related
+            or _contains_military_reference(req.record_type)
+            or _contains_military_reference(req.name)
+            or _contains_military_reference(req.payload)
+        ),
         compartment="executive-presidency",
         classification=req.classification,
         profile=req.protection_profile,
@@ -196,7 +201,7 @@ def list_activity(limit: int = 100, p: Principal = Depends(require_principal)):
 @app.post("/vault/objects")
 def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
     classification, profile, military = _enforce_military_object_policy(
-        military_related=req.military_related,
+        military_related=(req.military_related or _contains_military_reference(req.name) or _contains_military_reference(req.value)),
         compartment=req.compartment,
         classification=req.classification,
         profile=req.protection_profile,
@@ -273,8 +278,25 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
 MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 FILE_MAGIC = b"UNGVAULT1\n"
 MILITARY_COMPARTMENT_TERMS = ("military","defence","defense","armed-forces","armed_forces","army","air-force","air_force","navy")
+MILITARY_CONTENT_TERMS = (
+    "military","defence","defense","armed forces","armed-forces","army","air force","air-force","navy",
+    "chief of defence","chief of defense","defence minister","defense minister","ministry of defence","ministry of defense",
+    "barracks","brigade","battalion","regiment","command post","military intelligence","defence intelligence",
+    "defense intelligence","joint staff","general headquarters","ghq"
+)
 MILITARY_MIN_REDACTION = 5
 MILITARY_MAX_REDACTION = 95
+
+def _contains_military_reference(value) -> bool:
+    try:
+        if isinstance(value, dict):
+            return any(_contains_military_reference(k) or _contains_military_reference(v) for k, v in value.items())
+        if isinstance(value, (list, tuple, set)):
+            return any(_contains_military_reference(v) for v in value)
+        text = str(value or "").strip().lower()
+        return any(term in text for term in MILITARY_CONTENT_TERMS)
+    except Exception:
+        return False
 
 def _military_compartment(compartment: str) -> bool:
     value = (compartment or "").strip().lower().replace(" ", "-")
