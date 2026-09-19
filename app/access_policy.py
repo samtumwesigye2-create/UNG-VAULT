@@ -41,6 +41,7 @@ PROFILES = {
     "VAULT-LEGACY": VaultProfile("VAULT-LEGACY", "Legacy Interoperability Mode", AccessTier.EXECUTIVE_STAFF, 3),
     "VAULT-CASCADE": VaultProfile("VAULT-CASCADE", "Multi-Domain Cascade Protection", AccessTier.EXECUTIVE_STAFF, 3),
     "VAULT-TRANSIT": VaultProfile("VAULT-TRANSIT", "Signed Encrypted Transit Packages", AccessTier.SENIOR_STAFF, 2),
+    "VAULT-MIL": VaultProfile("VAULT-MIL", "Military / Defence Protected Vault", AccessTier.EXECUTIVE_STAFF, 3),
 }
 
 FULL_VAULT_TIERS = frozenset({AccessTier.PRESIDENT, AccessTier.CABINET})
@@ -93,6 +94,7 @@ VAULT_DOCUMENT_COLORS = {
     "VAULT-LEGACY": {"name": "Blue", "hex": "#1D4ED8"},
     "VAULT-CASCADE": {"name": "Purple", "hex": "#7E22CE"},
     "VAULT-TRANSIT": {"name": "Green", "hex": "#15803D"},
+    "VAULT-MIL": {"name": "Olive", "hex": "#3F6212"},
 }
 
 def document_marking(profile_code: str) -> dict:
