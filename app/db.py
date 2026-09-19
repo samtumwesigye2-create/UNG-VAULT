@@ -11,7 +11,13 @@ CREATE TABLE IF NOT EXISTS vault_objects (
   name TEXT NOT NULL,
   envelope JSONB NOT NULL,
   created_by TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  military_branch TEXT,
+  tracking_number TEXT,
+  operation_location TEXT,
+  deleted_at TIMESTAMPTZ,
+  deleted_by TEXT,
+  delete_tracking_number TEXT
 );
 CREATE TABLE IF NOT EXISTS vault_audit (
   seq BIGSERIAL PRIMARY KEY,
@@ -24,7 +30,16 @@ CREATE TABLE IF NOT EXISTS vault_audit (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS protection_profile TEXT;
+ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS military_branch TEXT;
+ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS tracking_number TEXT;
+ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS operation_location TEXT;
+ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS deleted_by TEXT;
+ALTER TABLE vault_objects ADD COLUMN IF NOT EXISTS delete_tracking_number TEXT;
 CREATE INDEX IF NOT EXISTS ix_vault_objects_compartment ON vault_objects(compartment);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_vault_objects_tracking ON vault_objects(tracking_number) WHERE tracking_number IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_vault_objects_military_branch ON vault_objects(military_branch) WHERE military_branch IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_vault_objects_deleted_at ON vault_objects(deleted_at);
 CREATE INDEX IF NOT EXISTS ix_vault_audit_created_at ON vault_audit(created_at DESC);
 CREATE TABLE IF NOT EXISTS vault_scif_sessions (
   id UUID PRIMARY KEY,
