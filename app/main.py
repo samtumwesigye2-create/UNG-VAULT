@@ -530,6 +530,51 @@ async def unlock_share(
     })
 
 
+@app.get("/vault/military/summary")
+def military_summary(p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM vault_objects WHERE protection_profile='VAULT-MIL'")
+            protected_objects = int(cur.fetchone()["n"])
+            cur.execute("""SELECT COUNT(*) AS n FROM vault_audit
+                           WHERE action IN ('military_file_fully_encrypted','military_file_redacted_release','military_file_decrypted')""")
+            file_events = int(cur.fetchone()["n"])
+            cur.execute("""SELECT COUNT(*) AS n FROM vault_audit
+                           WHERE action='military_file_redacted_release'""")
+            redacted_releases = int(cur.fetchone()["n"])
+            cur.execute("""SELECT COUNT(*) AS n FROM vault_audit
+                           WHERE action='military_file_fully_encrypted'""")
+            encrypted_files = int(cur.fetchone()["n"])
+            cur.execute("""SELECT seq,actor,action,object_id,detail,created_at
+                           FROM vault_audit
+                           WHERE action LIKE 'military_%'
+                           ORDER BY seq DESC LIMIT 25""")
+            activity = cur.fetchall()
+    return {
+        "profile": "VAULT-MIL",
+        "protected_objects": protected_objects,
+        "encrypted_files": encrypted_files,
+        "redacted_releases": redacted_releases,
+        "file_events": file_events,
+        "release_policy": {
+            "full_encryption": True,
+            "redaction_min_percent": MILITARY_MIN_REDACTION,
+            "redaction_max_percent": MILITARY_MAX_REDACTION,
+            "classification_floor": "restricted",
+            "approvals_required": PROFILES["VAULT-MIL"].approvals_required,
+            "minimum_tier": PROFILES["VAULT-MIL"].minimum_tier.name,
+        },
+        "recent_activity": [{
+            "seq": row["seq"],
+            "actor": row["actor"],
+            "action": row["action"],
+            "object_id": row["object_id"],
+            "detail": row["detail"],
+            "created_at": row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+        } for row in activity],
+    }
+
+
 @app.get("/vault/profiles")
 def vault_profiles(p: Principal = Depends(require_principal)):
     """UI registry for consistent VAULT badges and document markings."""
