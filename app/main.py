@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
 from .auth import Principal, authorize, require_principal, principal_from_authorization, exchange_scif_handle
 from .audit import append_audit, verify_chain
@@ -36,6 +36,7 @@ app = FastAPI(title="UNG-VAULT", version="1.1.0")
 PRESIDENT_INGEST_SECRET = os.getenv("PRESIDENT_INGEST_SECRET", "")
 VAULT_MIL_RECEIPT_HMAC_SECRET = os.getenv("VAULT_MIL_RECEIPT_HMAC_SECRET", "")
 VAULT_MIL_RECEIPT_ED25519_SEED_B64 = os.getenv("VAULT_MIL_RECEIPT_ED25519_SEED_B64", "")
+VAULT_MIL_RECEIPT_KEY_ID = os.getenv("VAULT_MIL_RECEIPT_KEY_ID", "").strip()
 
 def _require_military_admin_fresh_mfa(p: Principal, action: str) -> None:
     roles=set(map(str,p.claims.get("roles",[])))
@@ -77,6 +78,36 @@ def _military_receipt_public_key_b64() -> str:
         format=serialization.PublicFormat.Raw,
     )
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+def _military_receipt_key_id() -> str:
+    raw=_military_receipt_signing_key().public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    fingerprint=hashlib.sha256(raw).hexdigest()
+    return VAULT_MIL_RECEIPT_KEY_ID or ("ed25519-"+fingerprint[:16])
+
+def _register_military_receipt_signing_key() -> str:
+    key_id=_military_receipt_key_id()
+    public_key=_military_receipt_public_key_b64()
+    import base64
+    raw=base64.urlsafe_b64decode(public_key + "=" * (-len(public_key) % 4))
+    fingerprint=hashlib.sha256(raw).hexdigest()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE military_receipt_signing_keys
+                           SET is_active=FALSE,retired_at=COALESCE(retired_at,now())
+                           WHERE is_active=TRUE AND key_id<>%s""",(key_id,))
+            cur.execute("""INSERT INTO military_receipt_signing_keys
+                           (key_id,algorithm,public_key_b64url,fingerprint_sha256,is_active,retired_at)
+                           VALUES(%s,'Ed25519',%s,%s,TRUE,NULL)
+                           ON CONFLICT (key_id) DO UPDATE
+                           SET public_key_b64url=EXCLUDED.public_key_b64url,
+                               fingerprint_sha256=EXCLUDED.fingerprint_sha256,
+                               is_active=TRUE,
+                               retired_at=NULL""",
+                        (key_id,public_key,fingerprint))
+    return key_id
 
 def _sign_military_receipt(payload: dict) -> str:
     if not VAULT_MIL_RECEIPT_HMAC_SECRET:
@@ -128,6 +159,7 @@ class MilitaryReleaseDecisionRequest(BaseModel):
 def startup():
     load_settings()
     init_db()
+    _register_military_receipt_signing_key()
     threading.Thread(target=_sentinel_outbox_worker,name="sentinel-outbox",daemon=True).start()
     _flush_sentinel_outbox()
     print("SENTINEL_SIGNED_CHANNEL=" + ("ok" if _sentinel_signed_probe() else "degraded"))
@@ -535,9 +567,71 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
 @app.get("/vault/military/receipt-public-key")
 def military_receipt_public_key(p: Principal = Depends(require_principal)):
     return {
+        "key_id":_military_receipt_key_id(),
         "algorithm":"Ed25519",
         "public_key_b64url":_military_receipt_public_key_b64(),
         "usage":"Verify UNG-VAULT military release receipt signatures",
+    }
+
+@app.get("/vault/military/receipt-keys")
+def military_receipt_keys(p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT key_id,algorithm,public_key_b64url,fingerprint_sha256,
+                                  activated_at,retired_at,is_active
+                           FROM military_receipt_signing_keys
+                           ORDER BY activated_at DESC""")
+            rows=cur.fetchall()
+    return {"keys":[{
+        "key_id":r["key_id"],
+        "algorithm":r["algorithm"],
+        "public_key_b64url":r["public_key_b64url"],
+        "fingerprint_sha256":r["fingerprint_sha256"],
+        "activated_at":r["activated_at"].isoformat() if r["activated_at"] else None,
+        "retired_at":r["retired_at"].isoformat() if r["retired_at"] else None,
+        "is_active":bool(r["is_active"]),
+    } for r in rows]}
+
+@app.post("/vault/military/receipt/verify-file")
+async def verify_military_receipt_file(
+    file: UploadFile = File(...),
+    p: Principal = Depends(require_principal),
+):
+    raw=await file.read(1024*1024)
+    try:
+        receipt=json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400,"Receipt must be valid JSON") from None
+    key_id=str(receipt.get("receipt_signing_key_id") or "").strip()
+    signature=str(receipt.get("receipt_signature_ed25519") or "").strip()
+    if not key_id or not signature:
+        raise HTTPException(400,"Receipt is missing signing key ID or Ed25519 signature")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT public_key_b64url,is_active,retired_at
+                           FROM military_receipt_signing_keys WHERE key_id=%s""",(key_id,))
+            keyrow=cur.fetchone()
+    if not keyrow:
+        raise HTTPException(404,"Receipt signing key is not in the VAULT key registry")
+    signed=dict(receipt)
+    signed.pop("receipt_signature_ed25519",None)
+    signed.pop("receipt_public_key_b64url",None)
+    signed.pop("receipt_signing_key_id",None)
+    import base64
+    try:
+        pub_raw=base64.urlsafe_b64decode(keyrow["public_key_b64url"] + "=" * (-len(keyrow["public_key_b64url"]) % 4))
+        sig_raw=base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        canonical=json.dumps(signed,sort_keys=True,separators=(",",":")).encode("utf-8")
+        Ed25519PublicKey.from_public_bytes(pub_raw).verify(sig_raw,canonical)
+        valid=True
+    except Exception:
+        valid=False
+    return {
+        "verified":valid,
+        "key_id":key_id,
+        "key_active":bool(keyrow["is_active"]),
+        "key_retired_at":keyrow["retired_at"].isoformat() if keyrow["retired_at"] else None,
+        "receipt_sha256":receipt.get("receipt_sha256"),
     }
 
 @app.get("/vault/military/releases/{request_id}/receipt")
@@ -580,6 +674,7 @@ def military_release_receipt(request_id: str, p: Principal = Depends(require_pri
     receipt_payload["receipt_signature_hmac_sha256"]=_sign_military_receipt(receipt_payload)
     receipt_payload["receipt_signature_ed25519"]=_sign_military_receipt_ed25519(receipt_payload)
     receipt_payload["receipt_public_key_b64url"]=_military_receipt_public_key_b64()
+    receipt_payload["receipt_signing_key_id"]=_military_receipt_key_id()
     return receipt_payload
 
 @app.get("/vault/military/releases/{request_id}/receipt/download")
@@ -622,6 +717,7 @@ def download_military_release_receipt(request_id: str, p: Principal = Depends(re
     receipt["receipt_signature_hmac_sha256"]=_sign_military_receipt(receipt)
     receipt["receipt_signature_ed25519"]=_sign_military_receipt_ed25519(receipt)
     receipt["receipt_public_key_b64url"]=_military_receipt_public_key_b64()
+    receipt["receipt_signing_key_id"]=_military_receipt_key_id()
     body=json.dumps(receipt,indent=2,sort_keys=True).encode("utf-8")
     return Response(body,media_type="application/json",headers={
         "Content-Disposition":f"attachment; filename=VAULT-MIL-RECEIPT-{request_id}.json",
