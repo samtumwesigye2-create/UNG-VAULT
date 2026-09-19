@@ -474,6 +474,8 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
 
 @app.post("/vault/military/releases/{request_id}/approve")
 def approve_military_release(request_id: str, p: Principal = Depends(require_principal)):
+    if p.clearance not in {"restricted","top_secret"}:
+        raise HTTPException(403,"Restricted clearance or higher is required to approve a military release")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM military_release_requests WHERE id=%s FOR UPDATE""",(request_id,))
