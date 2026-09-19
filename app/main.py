@@ -621,8 +621,15 @@ def military_branches(p: Principal = Depends(require_principal)):
     return {"branches": list(MILITARY_BRANCHES)}
 
 @app.get("/vault/military/records")
-def military_records(include_deleted: bool = False, limit: int = 200, p: Principal = Depends(require_principal)):
+def military_records(
+    include_deleted: bool = False,
+    limit: int = 200,
+    branch: str | None = None,
+    q: str | None = None,
+    p: Principal = Depends(require_principal),
+):
     limit = max(1, min(500, int(limit)))
+    params = []
     with connect() as conn:
         with conn.cursor() as cur:
             sql = """SELECT id,name,classification,compartment,created_by,created_at,military_branch,tracking_number,
@@ -631,8 +638,19 @@ def military_records(include_deleted: bool = False, limit: int = 200, p: Princip
                      WHERE protection_profile='VAULT-MIL'"""
             if not include_deleted:
                 sql += " AND deleted_at IS NULL"
+            if branch:
+                if branch not in MILITARY_BRANCHES:
+                    raise HTTPException(400, "Unknown military branch")
+                sql += " AND COALESCE(military_branch,'Joint Headquarters')=%s"
+                params.append(branch)
+            if q and q.strip():
+                term = "%" + q.strip()[:120] + "%"
+                sql += """ AND (name ILIKE %s OR COALESCE(tracking_number,'') ILIKE %s
+                               OR COALESCE(operation_location,'') ILIKE %s OR created_by ILIKE %s)"""
+                params.extend([term, term, term, term])
             sql += " ORDER BY created_at DESC LIMIT %s"
-            cur.execute(sql, (limit,))
+            params.append(limit)
+            cur.execute(sql, tuple(params))
             rows = cur.fetchall()
     return {"records":[{
         "id": str(r["id"]), "tracking_number": r["tracking_number"], "name": r["name"],
@@ -765,6 +783,12 @@ def military_summary(p: Principal = Depends(require_principal)):
             cur.execute("""SELECT COUNT(*) AS n FROM vault_audit
                            WHERE action='military_file_fully_encrypted'""")
             encrypted_files = int(cur.fetchone()["n"])
+            cur.execute("""SELECT COALESCE(military_branch,'Joint Headquarters') AS branch,COUNT(*) AS n
+                           FROM vault_objects
+                           WHERE protection_profile='VAULT-MIL' AND deleted_at IS NULL
+                           GROUP BY COALESCE(military_branch,'Joint Headquarters')
+                           ORDER BY branch""")
+            branch_counts = {row["branch"]: int(row["n"]) for row in cur.fetchall()}
             cur.execute("""SELECT seq,actor,action,object_id,detail,created_at
                            FROM vault_audit
                            WHERE action LIKE 'military_%'
@@ -773,6 +797,8 @@ def military_summary(p: Principal = Depends(require_principal)):
     return {
         "profile": "VAULT-MIL",
         "protected_objects": protected_objects,
+        "branches": list(MILITARY_BRANCHES),
+        "branch_counts": branch_counts,
         "encrypted_files": encrypted_files,
         "redacted_releases": redacted_releases,
         "file_events": file_events,
