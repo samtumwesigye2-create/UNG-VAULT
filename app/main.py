@@ -52,6 +52,7 @@ class PresidentRecordRequest(BaseModel):
     principal: str = Field(min_length=1, max_length=200)
     classification: str = "confidential"
     protection_profile: str = "VAULT-ENVELOPE"
+    military_related: bool = False
     payload: dict
 
 class StoreRequest(BaseModel):
@@ -59,6 +60,7 @@ class StoreRequest(BaseModel):
     compartment: str = Field(min_length=1, max_length=100)
     classification: str
     protection_profile: str | None = None
+    military_related: bool = False
     value: str
 
 @app.on_event("startup")
@@ -104,7 +106,13 @@ def ingest_president_record(
     _verify_president_record_signature(req, x_ung_president_signature)
     if req.classification not in {"public", "internal", "confidential", "restricted", "top_secret"}:
         raise HTTPException(400, "invalid_classification")
-    if req.protection_profile not in PROFILES:
+    classification, protection_profile, military = _enforce_military_object_policy(
+        military_related=req.military_related,
+        compartment="executive-presidency",
+        classification=req.classification,
+        profile=req.protection_profile,
+    )
+    if protection_profile not in PROFILES:
         raise HTTPException(400, "unknown_protection_profile")
     object_id = str(uuid.uuid4())
     value = json.dumps(req.payload, sort_keys=True, separators=(",", ":"))
@@ -115,19 +123,21 @@ def ingest_president_record(
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
-                (object_id, compartment, req.classification, req.protection_profile, req.name, json.dumps(envelope), created_by),
+                (object_id, compartment, classification, protection_profile, req.name, json.dumps(envelope), created_by),
             )
             append_audit(cur, created_by, "president_record_ingested", object_id, {
                 "record_type": req.record_type,
-                "classification": req.classification,
-                "protection_profile": req.protection_profile,
+                "classification": classification,
+                "protection_profile": protection_profile,
+                "military_related": military,
                 "source": "UNG-PRESIDENT",
             })
     return {
         "id": object_id,
         "record_type": req.record_type,
-        "classification": req.classification,
-        "protection_profile": req.protection_profile,
+        "classification": classification,
+        "protection_profile": protection_profile,
+        "military_related": military,
         "compartment": compartment,
         "encrypted": True,
     }
@@ -192,7 +202,12 @@ def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
             with conn.cursor() as cur:
                 append_audit(cur, p.subject, "denied_create", detail={"classification":req.classification,"compartment":req.compartment})
         raise
-    profile = req.protection_profile or "VAULT-ENVELOPE"
+    classification, profile, military = _enforce_military_object_policy(
+        military_related=req.military_related,
+        compartment=req.compartment,
+        classification=req.classification,
+        profile=req.protection_profile,
+    )
     if profile not in PROFILES:
         raise HTTPException(400, "Unknown VAULT protection profile")
     object_id = str(uuid.uuid4())
@@ -201,18 +216,20 @@ def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
-                (object_id,req.compartment,req.classification,profile,req.name,json.dumps(envelope),p.subject),
+                (object_id,req.compartment,classification,profile,req.name,json.dumps(envelope),p.subject),
             )
             append_audit(cur, p.subject, "object_created", object_id, {
-                "classification": req.classification,
+                "classification": classification,
                 "compartment": req.compartment,
                 "protection_profile": profile,
+                "military_related": military,
             })
     return {
         "id": object_id,
         "name": req.name,
-        "classification": req.classification,
+        "classification": classification,
         "protection_profile": profile,
+        "military_related": military,
         "marking": marking_payload(profile, object_id),
     }
 
@@ -255,6 +272,24 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
 
 MAX_FILE_BYTES = int(os.getenv("VAULT_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 FILE_MAGIC = b"UNGVAULT1\n"
+MILITARY_COMPARTMENT_TERMS = ("military","defence","defense","armed-forces","armed_forces","army","air-force","air_force","navy")
+MILITARY_MIN_REDACTION = 5
+MILITARY_MAX_REDACTION = 95
+
+def _military_compartment(compartment: str) -> bool:
+    value = (compartment or "").strip().lower().replace(" ", "-")
+    return any(term in value for term in MILITARY_COMPARTMENT_TERMS)
+
+def _enforce_military_object_policy(*, military_related: bool, compartment: str, classification: str, profile: str | None):
+    military = bool(military_related or _military_compartment(compartment))
+    if not military:
+        return classification, profile or "VAULT-ENVELOPE", False
+    rank = {"public":0,"internal":1,"confidential":2,"restricted":3,"top_secret":4}
+    if classification not in rank:
+        raise HTTPException(400, "Invalid security classification")
+    protected_classification = classification if rank[classification] >= rank["restricted"] else "restricted"
+    return protected_classification, "VAULT-MIL", True
+
 SCIF_IDLE_SECONDS = max(30, min(900, int(os.getenv("VAULT_SCIF_IDLE_SECONDS", "90"))))
 SCIF_APPROVAL_TTL_SECONDS = max(60, min(900, int(os.getenv("VAULT_SCIF_APPROVAL_TTL_SECONDS", "300"))))
 SCIF_MAX_ENTRY_FAILURES = max(3, min(10, int(os.getenv("VAULT_SCIF_MAX_ENTRY_FAILURES", "5"))))
@@ -265,6 +300,82 @@ SENTINEL_INGEST_SECRET = os.getenv("SENTINEL_INGEST_SECRET", "")
 
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
+
+@app.post("/vault/military/files/protect")
+async def military_file_protect(
+    file: UploadFile = File(...),
+    mode: str = Form(...),
+    percentage: int = Form(95),
+    p: Principal = Depends(require_principal),
+):
+    data = await file.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
+    name = _safe_name(file.filename)
+    mode = (mode or "").strip().lower()
+    event_id = str(uuid.uuid4())
+
+    if mode == "encrypt":
+        envelope = encrypt_bytes(data, event_id.encode())
+        package = {
+            "format": "UNG-VAULT-MILITARY-FILE",
+            "version": 1,
+            "id": event_id,
+            "filename": name,
+            "profile": "VAULT-MIL",
+            "classification_floor": "restricted",
+            "envelope": envelope,
+        }
+        payload = FILE_MAGIC + json.dumps(package, separators=(",", ":")).encode()
+        with connect() as conn:
+            with conn.cursor() as cur:
+                append_audit(cur, p.subject, "military_file_fully_encrypted", event_id, {
+                    "filename": name, "bytes": len(data), "profile": "VAULT-MIL"
+                })
+        return Response(
+            payload,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(name + '.mil.ungvault')}",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-UNG-VAULT-Profile": "VAULT-MIL",
+                "X-UNG-Military-Handling": "full-encryption",
+            },
+        )
+
+    if mode == "redact":
+        if percentage < MILITARY_MIN_REDACTION or percentage > MILITARY_MAX_REDACTION:
+            raise HTTPException(400, f"Military redaction must be between {MILITARY_MIN_REDACTION}% and {MILITARY_MAX_REDACTION}%")
+        try:
+            result = redact_file(data, percentage, file.content_type or "", name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        with connect() as conn:
+            with conn.cursor() as cur:
+                append_audit(cur, p.subject, "military_file_redacted_release", event_id, {
+                    "filename": name,
+                    "bytes": len(data),
+                    "percentage": percentage,
+                    "profile": "VAULT-MIL",
+                    "irreversible": True,
+                })
+        stem = Path(name).stem[:150] or "military-file"
+        out = stem + f".mil-redacted-{percentage}" + result.suffix
+        return Response(
+            result.data,
+            media_type=result.media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(out)}",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-UNG-VAULT-Profile": "VAULT-MIL",
+                "X-UNG-Military-Handling": f"redacted-{percentage}",
+            },
+        )
+
+    raise HTTPException(400, "Military handling mode must be 'encrypt' or 'redact'")
+
 
 @app.post("/vault/files/encrypt")
 async def encrypt_file(file: UploadFile = File(...), p: Principal = Depends(require_principal)):
