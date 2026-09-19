@@ -128,16 +128,30 @@ def ingest_president_record(
     created_by = "UNG-PRESIDENT:" + req.principal
     with connect() as conn:
         with conn.cursor() as cur:
+            military_branch = None
+            tracking_number = None
+            operation_location = None
+            if military:
+                candidate_branch = str(req.payload.get("military_branch") or req.payload.get("branch") or "").strip() if isinstance(req.payload, dict) else ""
+                military_branch = candidate_branch if candidate_branch in MILITARY_BRANCHES else "Joint Headquarters"
+                tracking_number = _mil_tracking("MIL")
+                operation_location = str(req.payload.get("operation_location") or req.payload.get("location") or "UNG-PRESIDENT").strip()[:160] if isinstance(req.payload, dict) else "UNG-PRESIDENT"
             cur.execute(
-                "INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
-                (object_id, compartment, classification, protection_profile, req.name, json.dumps(envelope), created_by),
+                """INSERT INTO vault_objects(id,compartment,classification,protection_profile,name,envelope,created_by,
+                                             military_branch,tracking_number,operation_location)
+                   VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s)""",
+                (object_id, compartment, classification, protection_profile, req.name, json.dumps(envelope), created_by,
+                 military_branch, tracking_number, operation_location),
             )
-            append_audit(cur, created_by, "president_record_ingested", object_id, {
+            append_audit(cur, created_by, "military_record_created" if military else "president_record_ingested", object_id, {
                 "record_type": req.record_type,
                 "classification": classification,
                 "protection_profile": protection_profile,
                 "military_related": military,
                 "source": "UNG-PRESIDENT",
+                "tracking_number": tracking_number if military else None,
+                "military_branch": military_branch if military else None,
+                "operation_location": operation_location if military else None,
             })
     return {
         "id": object_id,
@@ -145,6 +159,8 @@ def ingest_president_record(
         "classification": classification,
         "protection_profile": protection_profile,
         "military_related": military,
+        "tracking_number": tracking_number if military else None,
+        "military_branch": military_branch if military else None,
         "compartment": compartment,
         "encrypted": True,
     }
@@ -371,6 +387,8 @@ async def military_file_protect(
     file: UploadFile = File(...),
     mode: str = Form(...),
     percentage: int = Form(95),
+    military_branch: str = Form("Joint Headquarters"),
+    operation_location: str = Form("not-declared"),
     p: Principal = Depends(require_principal),
 ):
     data = await file.read(MAX_FILE_BYTES + 1)
@@ -378,7 +396,12 @@ async def military_file_protect(
         raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
     name = _safe_name(file.filename)
     mode = (mode or "").strip().lower()
+    branch = (military_branch or "").strip()
+    if branch not in MILITARY_BRANCHES:
+        raise HTTPException(400, "Unknown military branch")
+    location = (operation_location or "").strip()[:160] or "not-declared"
     event_id = str(uuid.uuid4())
+    tracking_number = _mil_tracking("FILE")
 
     if mode == "encrypt":
         envelope = encrypt_bytes(data, event_id.encode())
@@ -388,7 +411,9 @@ async def military_file_protect(
             "id": event_id,
             "filename": name,
             "profile": "VAULT-MIL",
-        "branches": list(MILITARY_BRANCHES),
+            "military_branch": branch,
+            "tracking_number": tracking_number,
+            "operation_location": location,
             "classification_floor": "restricted",
             "envelope": envelope,
         }
@@ -396,7 +421,9 @@ async def military_file_protect(
         with connect() as conn:
             with conn.cursor() as cur:
                 append_audit(cur, p.subject, "military_file_fully_encrypted", event_id, {
-                    "filename": name, "bytes": len(data), "profile": "VAULT-MIL"
+                    "filename": name, "bytes": len(data), "profile": "VAULT-MIL",
+                    "tracking_number": tracking_number, "military_branch": branch,
+                    "operation_location": location
                 })
         return Response(
             payload,
@@ -407,6 +434,8 @@ async def military_file_protect(
                 "X-Content-Type-Options": "nosniff",
                 "X-UNG-VAULT-Profile": "VAULT-MIL",
                 "X-UNG-Military-Handling": "full-encryption",
+                "X-UNG-Tracking-Number": tracking_number,
+                "X-UNG-Military-Branch": branch,
             },
         )
 
@@ -424,6 +453,9 @@ async def military_file_protect(
                     "bytes": len(data),
                     "percentage": percentage,
                     "profile": "VAULT-MIL",
+                    "tracking_number": tracking_number,
+                    "military_branch": branch,
+                    "operation_location": location,
                     "irreversible": True,
                 })
         stem = Path(name).stem[:150] or "military-file"
@@ -437,6 +469,8 @@ async def military_file_protect(
                 "X-Content-Type-Options": "nosniff",
                 "X-UNG-VAULT-Profile": "VAULT-MIL",
                 "X-UNG-Military-Handling": f"redacted-{percentage}",
+                "X-UNG-Tracking-Number": tracking_number,
+                "X-UNG-Military-Branch": branch,
             },
         )
 
