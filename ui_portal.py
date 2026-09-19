@@ -1,9 +1,9 @@
 """Same-origin application screen and fixed JANUS sign-in delegation."""
 import json
 from urllib import request, error
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 from fastapi import Header, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 class MfaCode(BaseModel):
@@ -64,6 +64,29 @@ def install_ui(app,page,janus_url=None):
             raise HTTPException(503,'JANUS high-assurance service is unavailable') from None
         except (OSError,error.URLError,ValueError):
             raise HTTPException(503,'JANUS high-assurance service is unavailable') from None
+
+    SSO_CLIENT='ung-vault'
+    SSO_CALLBACK='https://ung-vault-production.up.railway.app/ui/sso/callback'
+
+    @app.get('/ui/sso/start')
+    def sso_start(state:str='vault'):
+        params=urlencode({'client_id':SSO_CLIENT,'redirect_uri':SSO_CALLBACK,'state':state})
+        return RedirectResponse(base+'/?'+params,status_code=302)
+
+    @app.get('/ui/sso/callback')
+    def sso_callback(code:str,state:str='vault'):
+        req=request.Request(base+'/v1/sso/exchange',data=json.dumps({'client_id':SSO_CLIENT,'redirect_uri':SSO_CALLBACK,'code':code}).encode(),headers={'Content-Type':'application/json','Accept':'application/json'},method='POST')
+        try:
+            with open_request(req) as response: payload=json.loads(response.read(65536))
+            token=payload.get('access_token','')
+            if not token: raise ValueError('Missing SSO token')
+        except error.HTTPError:
+            raise HTTPException(401,'JANUS SSO exchange denied') from None
+        except (OSError,error.URLError,ValueError):
+            raise HTTPException(503,'JANUS SSO exchange unavailable') from None
+        html="""<!doctype html><meta charset='utf-8'><title>UNG VAULT SSO</title><script>sessionStorage.setItem('ung_vault_sso',%s);location.replace('/?sso=1')</script>""" % json.dumps(token)
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(html,headers={'Cache-Control':'no-store','Referrer-Policy':'no-referrer'})
 
     @app.post('/ui/session')
     def login(body:Login):
