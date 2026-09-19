@@ -478,6 +478,45 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
         })
     return {"requests":out}
 
+@app.get("/vault/military/releases/{request_id}/receipt")
+def military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,"Military release request not found")
+            cur.execute("""SELECT seq,actor,action,detail,created_at
+                           FROM vault_audit
+                           WHERE object_id=%s
+                           ORDER BY seq ASC""",(request_id,))
+            events=cur.fetchall()
+    receipt_payload={
+        "request_id":request_id,
+        "status":row["status"],
+        "filename":row["file_name"],
+        "file_sha256":row["file_sha256"],
+        "military_branch":row["military_branch"],
+        "redaction_percentage":row["redaction_percentage"],
+        "reason":row["reason"],
+        "requested_by":row["requested_by"],
+        "approved_by":row["approved_by"] or [],
+        "approvals_required":PROFILES["VAULT-MIL"].approvals_required,
+        "created_at":row["created_at"].isoformat() if hasattr(row["created_at"],"isoformat") else str(row["created_at"]),
+        "expires_at":row["expires_at"].isoformat() if hasattr(row["expires_at"],"isoformat") else str(row["expires_at"]),
+        "consumed_at":row["consumed_at"].isoformat() if row["consumed_at"] and hasattr(row["consumed_at"],"isoformat") else (str(row["consumed_at"]) if row["consumed_at"] else None),
+        "events":[{
+            "seq":e["seq"],
+            "actor":e["actor"],
+            "action":e["action"],
+            "detail":e["detail"],
+            "created_at":e["created_at"].isoformat() if hasattr(e["created_at"],"isoformat") else str(e["created_at"]),
+        } for e in events],
+    }
+    canonical=json.dumps(receipt_payload,sort_keys=True,separators=(",",":")).encode("utf-8")
+    receipt_payload["receipt_sha256"]=hashlib.sha256(canonical).hexdigest()
+    return receipt_payload
+
 @app.post("/vault/military/releases/{request_id}/deny")
 def deny_military_release(request_id: str, req: MilitaryReleaseDecisionRequest, p: Principal = Depends(require_principal)):
     if p.clearance not in {"restricted","top_secret"}:
@@ -608,6 +647,7 @@ async def military_file_protect(
                 "X-UNG-Military-Handling": "full-encryption",
                 "X-UNG-Tracking-Number": tracking_number,
                 "X-UNG-Military-Branch": branch,
+                "X-UNG-Release-Request": rid if mode == "redact" else "",
             },
         )
 
