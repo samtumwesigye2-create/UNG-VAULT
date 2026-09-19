@@ -554,18 +554,21 @@ def verify_military_release_receipt(request_id: str, p: Principal = Depends(requ
     }
     canonical=json.dumps(receipt_payload,sort_keys=True,separators=(",",":")).encode("utf-8")
     receipt_hash=hashlib.sha256(canonical).hexdigest()
-    chain_ok=verify_chain()
     with connect() as conn:
         with conn.cursor() as cur:
+            chain_status=verify_chain(cur)
+            chain_ok=bool(chain_status.get("valid"))
             append_audit(cur,p.subject,"military_release_receipt_verified",request_id,{
                 "receipt_sha256":receipt_hash,
-                "audit_chain_valid":bool(chain_ok),
+                "audit_chain_valid":chain_ok,
+                "broken_at_seq":chain_status.get("broken_at_seq"),
             })
     return {
         "request_id":request_id,
         "receipt_sha256":receipt_hash,
-        "audit_chain_valid":bool(chain_ok),
-        "verified":bool(chain_ok),
+        "audit_chain_valid":chain_ok,
+        "verified":chain_ok,
+        "broken_at_seq":chain_status.get("broken_at_seq"),
     }
 
 @app.post("/vault/military/releases/{request_id}/deny")
