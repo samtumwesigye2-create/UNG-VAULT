@@ -552,7 +552,9 @@ async def request_military_redacted_release(
 
 @app.get("/vault/military/releases")
 def list_military_release_requests(limit: int = 50, p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military release queue")
+    perms=_military_permissions(p)
+    if not perms.intersection({"vault:military:approve","vault:military:audit","vault:military:records-admin"}):
+        raise HTTPException(403,"Military release queue requires approver, records-admin, or auditor permission")
     limit=max(1,min(200,int(limit)))
     with connect() as conn:
         with conn.cursor() as cur:
@@ -585,7 +587,7 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
 
 @app.get("/vault/military/receipt-public-key")
 def military_receipt_public_key(p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military receipt public key")
+    _require_military_permission(p,"vault:military:audit","Military receipt public key")
     return {
         "key_id":_military_receipt_key_id(),
         "algorithm":"Ed25519",
@@ -595,7 +597,7 @@ def military_receipt_public_key(p: Principal = Depends(require_principal)):
 
 @app.get("/vault/military/receipt-keys")
 def military_receipt_keys(p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military receipt key registry")
+    _require_military_permission(p,"vault:military:audit","Military receipt key registry")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT key_id,algorithm,public_key_b64url,fingerprint_sha256,
@@ -618,7 +620,7 @@ async def verify_military_receipt_file(
     file: UploadFile = File(...),
     p: Principal = Depends(require_principal),
 ):
-    _require_military_read(p,"Military receipt verification")
+    _require_military_permission(p,"vault:military:audit","Military receipt verification")
     raw=await file.read(1024*1024)
     try:
         receipt=json.loads(raw.decode("utf-8"))
@@ -658,7 +660,7 @@ async def verify_military_receipt_file(
 
 @app.get("/vault/military/releases/{request_id}/receipt")
 def military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military release receipt")
+    _require_military_permission(p,"vault:military:audit","Military release receipt")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
@@ -702,7 +704,7 @@ def military_release_receipt(request_id: str, p: Principal = Depends(require_pri
 
 @app.get("/vault/military/releases/{request_id}/receipt/download")
 def download_military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military release receipt")
+    _require_military_permission(p,"vault:military:audit","Military release receipt")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
@@ -751,7 +753,7 @@ def download_military_release_receipt(request_id: str, p: Principal = Depends(re
 
 @app.post("/vault/military/releases/{request_id}/verify-receipt")
 def verify_military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military release receipt")
+    _require_military_permission(p,"vault:military:audit","Military release receipt")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
@@ -1007,6 +1009,10 @@ async def military_file_protect(
                 approved=list(release["approved_by"] or [])
                 if len(approved) < PROFILES["VAULT-MIL"].approvals_required:
                     raise HTTPException(403,"Military release request is missing required approvals")
+                if p.subject in approved:
+                    raise HTTPException(403,"A release approver cannot execute the final redacted release; an independent VAULT-MIL operator is required")
+                if release["requested_by"] == p.subject:
+                    raise HTTPException(403,"The release requester cannot execute the final redacted release; an independent VAULT-MIL operator is required")
         try:
             result = redact_file(data, percentage, file.content_type or "", name)
         except ValueError as exc:
@@ -1256,7 +1262,9 @@ def military_records(
 
 @app.get("/vault/military/records/{object_id}/history")
 def military_record_history(object_id: str, p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military chain of custody")
+    perms=_military_permissions(p)
+    if not perms.intersection({"vault:military:audit","vault:military:records-admin"}):
+        raise HTTPException(403,"Military chain of custody requires auditor or records-admin permission")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT id,name,military_branch,tracking_number,created_by,created_at,operation_location,
@@ -1381,7 +1389,7 @@ def delete_military_record(object_id: str, request: Request, p: Principal = Depe
 
 @app.get("/vault/sentinel/outbox")
 def sentinel_outbox_status(limit: int = 100, p: Principal = Depends(require_principal)):
-    _require_military_read(p,"SENTINEL delivery status")
+    _require_military_permission(p,"vault:military:audit","SENTINEL delivery status")
     limit=max(1,min(500,int(limit)))
     with connect() as conn:
         with conn.cursor() as cur:
@@ -1418,9 +1426,24 @@ def retry_sentinel_outbox(p: Principal = Depends(require_principal)):
     delivered=_flush_sentinel_outbox(100)
     return {"retried":True,"delivered_now":delivered}
 
+@app.get("/vault/military/access")
+def military_access(p: Principal = Depends(require_principal)):
+    perms=_military_permissions(p)
+    return {
+        "subject":p.subject,
+        "permissions":sorted(perms & MILITARY_PERMISSIONS),
+        "can_operate":"vault:military:operate" in perms,
+        "can_approve":"vault:military:approve" in perms,
+        "can_admin_records":"vault:military:records-admin" in perms,
+        "can_audit":"vault:military:audit" in perms,
+        "fresh_mfa":bool(p.claims.get("mfa")) and bool(p.claims.get("mfa_time")) and 0 <= (time.time()-float(p.claims.get("mfa_time") or 0)) <= 300,
+    }
+
 @app.get("/vault/military/summary")
 def military_summary(p: Principal = Depends(require_principal)):
-    _require_military_read(p,"Military Vault summary")
+    perms=_military_permissions(p)
+    if not perms.intersection({"vault:military:audit","vault:military:records-admin"}):
+        raise HTTPException(403,"Military Vault summary requires auditor or records-admin permission")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM vault_objects WHERE protection_profile='VAULT-MIL' AND deleted_at IS NULL")
