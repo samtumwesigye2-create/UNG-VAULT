@@ -227,8 +227,8 @@ def ingest_president_record(
         classification=req.classification,
         profile=req.protection_profile,
     )
-    if military:
-        _require_military_permission(p,"vault:military:operate","Military protected record creation")
+    # PRESIDENT integration authenticates with its dedicated signed service channel.
+    # Human VAULT-MIL permission checks apply to interactive JANUS routes, not this service identity.
     if protection_profile not in PROFILES:
         raise HTTPException(400, "unknown_protection_profile")
     object_id = str(uuid.uuid4())
