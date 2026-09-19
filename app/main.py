@@ -38,10 +38,25 @@ VAULT_MIL_RECEIPT_HMAC_SECRET = os.getenv("VAULT_MIL_RECEIPT_HMAC_SECRET", "")
 VAULT_MIL_RECEIPT_ED25519_SEED_B64 = os.getenv("VAULT_MIL_RECEIPT_ED25519_SEED_B64", "")
 VAULT_MIL_RECEIPT_KEY_ID = os.getenv("VAULT_MIL_RECEIPT_KEY_ID", "").strip()
 
-def _require_military_admin_fresh_mfa(p: Principal, action: str) -> None:
-    roles=set(map(str,p.claims.get("roles",[])))
-    if not roles.intersection({"platform-admin","security-admin"}):
-        raise HTTPException(403, f"{action} requires platform-admin or security-admin")
+MILITARY_PERMISSIONS={
+    "vault:military:operate",
+    "vault:military:approve",
+    "vault:military:records-admin",
+    "vault:military:audit",
+}
+
+def _military_permissions(p: Principal) -> set[str]:
+    return set(map(str,p.claims.get("permissions",[])))
+
+def _require_military_read(p: Principal, action: str="VAULT-MIL access") -> None:
+    if not (_military_permissions(p) & MILITARY_PERMISSIONS):
+        raise HTTPException(403, f"{action} requires a VAULT-MIL JANUS permission")
+
+def _require_military_permission(p: Principal, permission: str, action: str, *, fresh_mfa: bool=False) -> None:
+    if permission not in _military_permissions(p):
+        raise HTTPException(403, f"{action} requires JANUS permission: {permission}")
+    if not fresh_mfa:
+        return
     if p.claims.get("credential_kind") != "session":
         raise HTTPException(403, f"{action} requires an interactive human JANUS session")
     if not p.claims.get("mfa") or not p.claims.get("mfa_time"):
@@ -212,6 +227,8 @@ def ingest_president_record(
         classification=req.classification,
         profile=req.protection_profile,
     )
+    if military:
+        _require_military_permission(p,"vault:military:operate","Military protected record creation")
     if protection_profile not in PROFILES:
         raise HTTPException(400, "unknown_protection_profile")
     object_id = str(uuid.uuid4())
@@ -487,6 +504,7 @@ async def request_military_redacted_release(
     reason: str = Form(...),
     p: Principal = Depends(require_principal),
 ):
+    _require_military_permission(p,"vault:military:operate","Military release request")
     data = await file.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
@@ -534,6 +552,7 @@ async def request_military_redacted_release(
 
 @app.get("/vault/military/releases")
 def list_military_release_requests(limit: int = 50, p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military release queue")
     limit=max(1,min(200,int(limit)))
     with connect() as conn:
         with conn.cursor() as cur:
@@ -566,6 +585,7 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
 
 @app.get("/vault/military/receipt-public-key")
 def military_receipt_public_key(p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military receipt public key")
     return {
         "key_id":_military_receipt_key_id(),
         "algorithm":"Ed25519",
@@ -575,6 +595,7 @@ def military_receipt_public_key(p: Principal = Depends(require_principal)):
 
 @app.get("/vault/military/receipt-keys")
 def military_receipt_keys(p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military receipt key registry")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT key_id,algorithm,public_key_b64url,fingerprint_sha256,
@@ -597,6 +618,7 @@ async def verify_military_receipt_file(
     file: UploadFile = File(...),
     p: Principal = Depends(require_principal),
 ):
+    _require_military_read(p,"Military receipt verification")
     raw=await file.read(1024*1024)
     try:
         receipt=json.loads(raw.decode("utf-8"))
@@ -636,6 +658,7 @@ async def verify_military_receipt_file(
 
 @app.get("/vault/military/releases/{request_id}/receipt")
 def military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military release receipt")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
@@ -679,6 +702,7 @@ def military_release_receipt(request_id: str, p: Principal = Depends(require_pri
 
 @app.get("/vault/military/releases/{request_id}/receipt/download")
 def download_military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military release receipt")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
@@ -727,6 +751,7 @@ def download_military_release_receipt(request_id: str, p: Principal = Depends(re
 
 @app.post("/vault/military/releases/{request_id}/verify-receipt")
 def verify_military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military release receipt")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM military_release_requests WHERE id=%s""",(request_id,))
@@ -802,7 +827,7 @@ def verify_military_release_receipt(request_id: str, p: Principal = Depends(requ
 
 @app.post("/vault/military/releases/{request_id}/deny")
 def deny_military_release(request_id: str, req: MilitaryReleaseDecisionRequest, p: Principal = Depends(require_principal)):
-    _require_military_admin_fresh_mfa(p, "Military release denial")
+    _require_military_permission(p,"vault:military:approve","Military release denial",fresh_mfa=True)
     if p.clearance not in {"restricted","top_secret"}:
         raise HTTPException(403,"Restricted clearance or higher is required to deny a military release")
     with connect() as conn:
@@ -852,7 +877,7 @@ def cancel_military_release(request_id: str, req: MilitaryReleaseDecisionRequest
 
 @app.post("/vault/military/releases/{request_id}/approve")
 def approve_military_release(request_id: str, p: Principal = Depends(require_principal)):
-    _require_military_admin_fresh_mfa(p, "Military release approval")
+    _require_military_permission(p,"vault:military:approve","Military release approval",fresh_mfa=True)
     if p.clearance not in {"restricted","top_secret"}:
         raise HTTPException(403,"Restricted clearance or higher is required to approve a military release")
     with connect() as conn:
@@ -905,6 +930,7 @@ async def military_file_protect(
     release_request_id: str = Form(""),
     p: Principal = Depends(require_principal),
 ):
+    _require_military_permission(p,"vault:military:operate","Military file protection")
     data = await file.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
@@ -950,7 +976,6 @@ async def military_file_protect(
                 "X-UNG-Military-Handling": "full-encryption",
                 "X-UNG-Tracking-Number": tracking_number,
                 "X-UNG-Military-Branch": branch,
-                "X-UNG-Release-Request": rid if mode == "redact" else "",
             },
         )
 
@@ -1193,6 +1218,7 @@ def military_records(
     q: str | None = None,
     p: Principal = Depends(require_principal),
 ):
+    _require_military_read(p,"Military record ledger")
     limit = max(1, min(500, int(limit)))
     params = []
     with connect() as conn:
@@ -1230,6 +1256,7 @@ def military_records(
 
 @app.get("/vault/military/records/{object_id}/history")
 def military_record_history(object_id: str, p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military chain of custody")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT id,name,military_branch,tracking_number,created_by,created_at,operation_location,
@@ -1268,7 +1295,7 @@ def military_record_history(object_id: str, p: Principal = Depends(require_princ
 
 @app.post("/vault/military/records/{object_id}/transfer")
 def transfer_military_record(object_id: str, req: MilitaryTransferRequest, request: Request, p: Principal = Depends(require_principal)):
-    _require_military_admin_fresh_mfa(p, "Military record transfer")
+    _require_military_permission(p,"vault:military:records-admin","Military record transfer",fresh_mfa=True)
     if req.to_branch not in MILITARY_BRANCHES:
         raise HTTPException(400, "Unknown destination military branch")
     transfer_tracking = _mil_tracking("XFER")
@@ -1319,7 +1346,7 @@ def transfer_military_record(object_id: str, req: MilitaryTransferRequest, reque
 
 @app.delete("/vault/military/records/{object_id}")
 def delete_military_record(object_id: str, request: Request, p: Principal = Depends(require_principal)):
-    _require_military_admin_fresh_mfa(p, "Military record deletion")
+    _require_military_permission(p,"vault:military:records-admin","Military record deletion",fresh_mfa=True)
     deletion_tracking = _mil_tracking("DEL")
     origin = _request_origin(request)
     with connect() as conn:
@@ -1354,6 +1381,7 @@ def delete_military_record(object_id: str, request: Request, p: Principal = Depe
 
 @app.get("/vault/sentinel/outbox")
 def sentinel_outbox_status(limit: int = 100, p: Principal = Depends(require_principal)):
+    _require_military_read(p,"SENTINEL delivery status")
     limit=max(1,min(500,int(limit)))
     with connect() as conn:
         with conn.cursor() as cur:
@@ -1386,12 +1414,13 @@ def sentinel_outbox_status(limit: int = 100, p: Principal = Depends(require_prin
 
 @app.post("/vault/sentinel/outbox/retry")
 def retry_sentinel_outbox(p: Principal = Depends(require_principal)):
-    _require_military_admin_fresh_mfa(p,"SENTINEL outbox retry")
+    _require_military_permission(p,"vault:military:records-admin","SENTINEL outbox retry",fresh_mfa=True)
     delivered=_flush_sentinel_outbox(100)
     return {"retried":True,"delivered_now":delivered}
 
 @app.get("/vault/military/summary")
 def military_summary(p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military Vault summary")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM vault_objects WHERE protection_profile='VAULT-MIL' AND deleted_at IS NULL")
