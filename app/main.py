@@ -1214,6 +1214,7 @@ async def unlock_share(
 
 @app.get("/vault/military/branches")
 def military_branches(p: Principal = Depends(require_principal)):
+    _require_military_read(p,"Military branch directory")
     return {"branches": list(MILITARY_BRANCHES)}
 
 @app.get("/vault/military/records")
@@ -1224,7 +1225,9 @@ def military_records(
     q: str | None = None,
     p: Principal = Depends(require_principal),
 ):
-    _require_military_read(p,"Military record ledger")
+    perms=_military_permissions(p)
+    if not perms.intersection({"vault:military:operate","vault:military:records-admin","vault:military:audit"}):
+        raise HTTPException(403,"Military record ledger requires operator, records-admin, or auditor permission")
     limit = max(1, min(500, int(limit)))
     params = []
     with connect() as conn:
