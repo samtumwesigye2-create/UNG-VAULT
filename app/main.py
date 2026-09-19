@@ -65,6 +65,11 @@ class StoreRequest(BaseModel):
     operation_location: str | None = Field(default=None, max_length=160)
     value: str
 
+class MilitaryTransferRequest(BaseModel):
+    to_branch: str = Field(min_length=2, max_length=100)
+    operation_location: str | None = Field(default=None, max_length=160)
+    reason: str = Field(min_length=3, max_length=500)
+
 @app.on_event("startup")
 def startup():
     load_settings()
@@ -298,8 +303,11 @@ def get_object(object_id: str, p: Principal = Depends(require_principal)):
             except Exception:
                 append_audit(cur, p.subject, "decryption_failed", object_id)
                 _security_raise(cur, 409, "Ciphertext integrity verification failed")
-            append_audit(cur, p.subject, "object_read", object_id)
             profile = row.get("protection_profile") or "VAULT-ENVELOPE"
+            append_audit(cur, p.subject, "military_record_accessed" if profile == "VAULT-MIL" else "object_read", object_id, {
+                "classification": row["classification"],
+                "compartment": row["compartment"],
+            })
             return {
                 "id": str(row["id"]),
                 "name": row["name"],
@@ -636,6 +644,85 @@ def military_records(include_deleted: bool = False, limit: int = 200, p: Princip
         "deleted_at": r["deleted_at"].isoformat() if r["deleted_at"] and hasattr(r["deleted_at"],"isoformat") else (str(r["deleted_at"]) if r["deleted_at"] else None),
         "deleted_by": r["deleted_by"], "delete_tracking_number": r["delete_tracking_number"],
     } for r in rows]}
+
+@app.get("/vault/military/records/{object_id}/history")
+def military_record_history(object_id: str, p: Principal = Depends(require_principal)):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,name,military_branch,tracking_number,created_by,created_at,operation_location,
+                                  deleted_at,deleted_by,delete_tracking_number
+                           FROM vault_objects
+                           WHERE id=%s AND protection_profile='VAULT-MIL'""", (object_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Military record not found")
+            cur.execute("""SELECT seq,actor,action,object_id,detail,created_at
+                           FROM vault_audit
+                           WHERE object_id=%s
+                           ORDER BY seq ASC""", (object_id,))
+            events = cur.fetchall()
+    return {
+        "record": {
+            "id": str(row["id"]),
+            "tracking_number": row["tracking_number"],
+            "name": row["name"],
+            "branch": row["military_branch"] or "Joint Headquarters",
+            "created_by": row["created_by"],
+            "created_at": row["created_at"].isoformat() if hasattr(row["created_at"],"isoformat") else str(row["created_at"]),
+            "operation_location": row["operation_location"],
+            "deleted_at": row["deleted_at"].isoformat() if row["deleted_at"] and hasattr(row["deleted_at"],"isoformat") else (str(row["deleted_at"]) if row["deleted_at"] else None),
+            "deleted_by": row["deleted_by"],
+            "delete_tracking_number": row["delete_tracking_number"],
+        },
+        "events": [{
+            "seq": e["seq"],
+            "actor": e["actor"],
+            "action": e["action"],
+            "detail": e["detail"],
+            "created_at": e["created_at"].isoformat() if hasattr(e["created_at"],"isoformat") else str(e["created_at"]),
+        } for e in events],
+    }
+
+@app.post("/vault/military/records/{object_id}/transfer")
+def transfer_military_record(object_id: str, req: MilitaryTransferRequest, request: Request, p: Principal = Depends(require_principal)):
+    if req.to_branch not in MILITARY_BRANCHES:
+        raise HTTPException(400, "Unknown destination military branch")
+    transfer_tracking = _mil_tracking("XFER")
+    origin = _request_origin(request, req.operation_location)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,name,military_branch,tracking_number,deleted_at
+                           FROM vault_objects
+                           WHERE id=%s AND protection_profile='VAULT-MIL'""", (object_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Military record not found")
+            if row["deleted_at"] is not None:
+                raise HTTPException(409, "Deleted military records cannot be transferred")
+            from_branch = row["military_branch"] or "Joint Headquarters"
+            if from_branch == req.to_branch:
+                raise HTTPException(409, "Record is already assigned to that branch")
+            cur.execute("""UPDATE vault_objects
+                           SET military_branch=%s,operation_location=%s
+                           WHERE id=%s""", (req.to_branch, origin["location"], object_id))
+            append_audit(cur, p.subject, "military_record_transferred", object_id, {
+                "record_tracking_number": row["tracking_number"],
+                "transfer_tracking_number": transfer_tracking,
+                "from_branch": from_branch,
+                "to_branch": req.to_branch,
+                "reason": req.reason,
+                "where": origin,
+            })
+    return {
+        "transferred": True,
+        "id": object_id,
+        "record_tracking_number": row["tracking_number"],
+        "transfer_tracking_number": transfer_tracking,
+        "from_branch": from_branch,
+        "to_branch": req.to_branch,
+        "reason": req.reason,
+        "where": origin,
+    }
 
 @app.delete("/vault/military/records/{object_id}")
 def delete_military_record(object_id: str, request: Request, p: Principal = Depends(require_principal)):
