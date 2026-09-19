@@ -1446,6 +1446,15 @@ def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str
         "sent_at": utcnow().isoformat(),
         "nonce": secrets.token_urlsafe(24),
     }
+    stable_basis="|".join([
+        event_type or "",
+        object_id or "",
+        session_id or "",
+        owner or "",
+        title or "",
+        details or "",
+    ]).encode("utf-8")
+    payload["event_id"]="vault-"+hashlib.sha256(stable_basis).hexdigest()[:40]
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     signature = hmac.new(SENTINEL_INGEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
     req = urllib.request.Request(
@@ -1478,6 +1487,7 @@ def _sentinel_signed_probe() -> bool:
         "owner": None,
         "sent_at": utcnow().isoformat(),
         "nonce": secrets.token_urlsafe(24),
+        "event_id": "probe-" + secrets.token_urlsafe(18),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     signature = hmac.new(SENTINEL_INGEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
