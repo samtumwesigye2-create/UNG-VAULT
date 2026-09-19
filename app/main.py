@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 from .auth import Principal, authorize, require_principal, principal_from_authorization, exchange_scif_handle
 from .audit import append_audit, verify_chain
 from .crypto import decrypt_bytes, encrypt_bytes
@@ -33,6 +35,33 @@ from .config import load_settings
 app = FastAPI(title="UNG-VAULT", version="1.1.0")
 PRESIDENT_INGEST_SECRET = os.getenv("PRESIDENT_INGEST_SECRET", "")
 VAULT_MIL_RECEIPT_HMAC_SECRET = os.getenv("VAULT_MIL_RECEIPT_HMAC_SECRET", "")
+VAULT_MIL_RECEIPT_ED25519_SEED_B64 = os.getenv("VAULT_MIL_RECEIPT_ED25519_SEED_B64", "")
+
+def _military_receipt_signing_key() -> Ed25519PrivateKey:
+    if not VAULT_MIL_RECEIPT_ED25519_SEED_B64:
+        raise HTTPException(503, "Military receipt asymmetric signing is not configured")
+    try:
+        import base64
+        raw=base64.urlsafe_b64decode(VAULT_MIL_RECEIPT_ED25519_SEED_B64 + "=" * (-len(VAULT_MIL_RECEIPT_ED25519_SEED_B64) % 4))
+        if len(raw) != 32:
+            raise ValueError()
+        return Ed25519PrivateKey.from_private_bytes(raw)
+    except Exception:
+        raise HTTPException(503, "Military receipt signing key is invalid") from None
+
+def _sign_military_receipt_ed25519(payload: dict) -> str:
+    import base64
+    canonical=json.dumps(payload,sort_keys=True,separators=(",",":")).encode("utf-8")
+    sig=_military_receipt_signing_key().sign(canonical)
+    return base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+
+def _military_receipt_public_key_b64() -> str:
+    import base64
+    raw=_military_receipt_signing_key().public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 def _sign_military_receipt(payload: dict) -> str:
     if not VAULT_MIL_RECEIPT_HMAC_SECRET:
@@ -485,6 +514,14 @@ def list_military_release_requests(limit: int = 50, p: Principal = Depends(requi
         })
     return {"requests":out}
 
+@app.get("/vault/military/receipt-public-key")
+def military_receipt_public_key(p: Principal = Depends(require_principal)):
+    return {
+        "algorithm":"Ed25519",
+        "public_key_b64url":_military_receipt_public_key_b64(),
+        "usage":"Verify UNG-VAULT military release receipt signatures",
+    }
+
 @app.get("/vault/military/releases/{request_id}/receipt")
 def military_release_receipt(request_id: str, p: Principal = Depends(require_principal)):
     with connect() as conn:
@@ -523,6 +560,8 @@ def military_release_receipt(request_id: str, p: Principal = Depends(require_pri
     canonical=json.dumps(receipt_payload,sort_keys=True,separators=(",",":")).encode("utf-8")
     receipt_payload["receipt_sha256"]=hashlib.sha256(canonical).hexdigest()
     receipt_payload["receipt_signature_hmac_sha256"]=_sign_military_receipt(receipt_payload)
+    receipt_payload["receipt_signature_ed25519"]=_sign_military_receipt_ed25519(receipt_payload)
+    receipt_payload["receipt_public_key_b64url"]=_military_receipt_public_key_b64()
     return receipt_payload
 
 @app.get("/vault/military/releases/{request_id}/receipt/download")
@@ -563,6 +602,8 @@ def download_military_release_receipt(request_id: str, p: Principal = Depends(re
     canonical=json.dumps(receipt,sort_keys=True,separators=(",",":")).encode("utf-8")
     receipt["receipt_sha256"]=hashlib.sha256(canonical).hexdigest()
     receipt["receipt_signature_hmac_sha256"]=_sign_military_receipt(receipt)
+    receipt["receipt_signature_ed25519"]=_sign_military_receipt_ed25519(receipt)
+    receipt["receipt_public_key_b64url"]=_military_receipt_public_key_b64()
     body=json.dumps(receipt,indent=2,sort_keys=True).encode("utf-8")
     return Response(body,media_type="application/json",headers={
         "Content-Disposition":f"attachment; filename=VAULT-MIL-RECEIPT-{request_id}.json",
@@ -609,8 +650,17 @@ def verify_military_release_receipt(request_id: str, p: Principal = Depends(requ
     receipt_hash=hashlib.sha256(canonical).hexdigest()
     signed_payload=dict(receipt_payload)
     signed_payload["receipt_sha256"]=receipt_hash
-    signature=_sign_military_receipt(signed_payload)
-    signature_ok=bool(signature)
+    hmac_signature=_sign_military_receipt(signed_payload)
+    ed25519_signature=_sign_military_receipt_ed25519(signed_payload)
+    public_key_b64=_military_receipt_public_key_b64()
+    try:
+        import base64
+        sig_raw=base64.urlsafe_b64decode(ed25519_signature + "=" * (-len(ed25519_signature) % 4))
+        canonical_signed=json.dumps(signed_payload,sort_keys=True,separators=(",",":")).encode("utf-8")
+        _military_receipt_signing_key().public_key().verify(sig_raw,canonical_signed)
+        signature_ok=True
+    except Exception:
+        signature_ok=False
     with connect() as conn:
         with conn.cursor() as cur:
             chain_status=verify_chain(cur)
@@ -618,7 +668,8 @@ def verify_military_release_receipt(request_id: str, p: Principal = Depends(requ
             verified=bool(chain_ok and signature_ok)
             append_audit(cur,p.subject,"military_release_receipt_verified",request_id,{
                 "receipt_sha256":receipt_hash,
-                "receipt_signature_hmac_sha256":signature,
+                "receipt_signature_hmac_sha256":hmac_signature,
+                "receipt_signature_ed25519":ed25519_signature,
                 "signature_valid":signature_ok,
                 "audit_chain_valid":chain_ok,
                 "broken_at_seq":chain_status.get("broken_at_seq"),
@@ -626,7 +677,9 @@ def verify_military_release_receipt(request_id: str, p: Principal = Depends(requ
     return {
         "request_id":request_id,
         "receipt_sha256":receipt_hash,
-        "receipt_signature_hmac_sha256":signature,
+        "receipt_signature_hmac_sha256":hmac_signature,
+        "receipt_signature_ed25519":ed25519_signature,
+        "receipt_public_key_b64url":public_key_b64,
         "signature_valid":signature_ok,
         "audit_chain_valid":chain_ok,
         "verified":verified,
