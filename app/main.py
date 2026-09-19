@@ -133,6 +133,56 @@ def ingest_president_record(
     }
 
 
+@app.get("/vault/objects")
+def list_objects(limit: int = 100, p: Principal = Depends(require_principal)):
+    limit = max(1, min(250, int(limit)))
+    visible = []
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,name,compartment,classification,protection_profile,created_by,created_at
+                           FROM vault_objects ORDER BY created_at DESC LIMIT %s""", (limit,))
+            for row in cur.fetchall():
+                try:
+                    authorize(p, row["classification"], row["compartment"])
+                except HTTPException:
+                    continue
+                visible.append({
+                    "id": str(row["id"]),
+                    "name": row["name"],
+                    "compartment": row["compartment"],
+                    "classification": row["classification"],
+                    "protection_profile": row.get("protection_profile") or "VAULT-ENVELOPE",
+                    "created_by": row["created_by"],
+                    "created_at": row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+                })
+    return {"objects": visible, "count": len(visible)}
+
+
+@app.get("/vault/activity")
+def list_activity(limit: int = 100, p: Principal = Depends(require_principal)):
+    limit = max(1, min(250, int(limit)))
+    roles = set(map(str, p.claims.get("roles", [])))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if roles.intersection({"platform-admin", "security-admin"}):
+                cur.execute("""SELECT seq,actor,action,object_id,detail,created_at
+                               FROM vault_audit ORDER BY seq DESC LIMIT %s""", (limit,))
+            else:
+                cur.execute("""SELECT seq,actor,action,object_id,detail,created_at
+                               FROM vault_audit WHERE actor=%s ORDER BY seq DESC LIMIT %s""", (p.subject, limit))
+            rows = cur.fetchall()
+    return {
+        "activity": [{
+            "seq": r["seq"],
+            "actor": r["actor"],
+            "action": r["action"],
+            "object_id": r["object_id"],
+            "detail": r["detail"],
+            "created_at": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"]),
+        } for r in rows]
+    }
+
+
 @app.post("/vault/objects")
 def create_object(req: StoreRequest, p: Principal = Depends(require_principal)):
     try:
