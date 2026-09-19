@@ -1,4 +1,4 @@
-import json, uuid, os, hashlib, secrets, hmac, urllib.request, urllib.error, time
+import json, uuid, os, hashlib, secrets, hmac, urllib.request, urllib.error, time, threading
 from pathlib import Path
 from urllib.parse import urlsplit, quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Cookie, Header, Request
@@ -128,6 +128,8 @@ class MilitaryReleaseDecisionRequest(BaseModel):
 def startup():
     load_settings()
     init_db()
+    threading.Thread(target=_sentinel_outbox_worker,name="sentinel-outbox",daemon=True).start()
+    _flush_sentinel_outbox()
     print("SENTINEL_SIGNED_CHANNEL=" + ("ok" if _sentinel_signed_probe() else "degraded"))
 
 @app.get("/health")
@@ -440,6 +442,7 @@ SCIF_MAX_COOKIE_FAILURES = max(2, min(10, int(os.getenv("VAULT_SCIF_MAX_COOKIE_F
 SCIF_REQUIRED_CLASSIFICATIONS = {"restricted", "top_secret"}
 SENTINEL_BASE_URL = os.getenv("SENTINEL_BASE_URL", "").rstrip("/")
 SENTINEL_INGEST_SECRET = os.getenv("SENTINEL_INGEST_SECRET", "")
+SENTINEL_OUTBOX_POLL_SECONDS = max(5, min(300, int(os.getenv("SENTINEL_OUTBOX_POLL_SECONDS", "30"))))
 
 def _safe_name(name: str) -> str:
     return Path(name or "file").name.replace("\r", "_").replace("\n", "_")[:180] or "file"
@@ -1253,6 +1256,44 @@ def delete_military_record(object_id: str, request: Request, p: Principal = Depe
     return {"deleted": True, "sentinel_notified": sentinel_notified, "id": object_id, "record_tracking_number": row["tracking_number"],
             "delete_tracking_number": deletion_tracking, "deleted_by": p.subject, "where": origin}
 
+@app.get("/vault/sentinel/outbox")
+def sentinel_outbox_status(limit: int = 100, p: Principal = Depends(require_principal)):
+    limit=max(1,min(500,int(limit)))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT status,COUNT(*) AS n FROM sentinel_outbox GROUP BY status""")
+            counts={row["status"]:int(row["n"]) for row in cur.fetchall()}
+            cur.execute("""SELECT event_id,payload,status,attempts,last_attempt_at,next_attempt_at,delivered_at,last_error,
+                                  sentinel_alert_id,sentinel_incident_id,created_at
+                           FROM sentinel_outbox
+                           ORDER BY created_at DESC LIMIT %s""",(limit,))
+            rows=cur.fetchall()
+    return {
+        "counts":counts,
+        "events":[{
+            "event_id":row["event_id"],
+            "event_type":(row["payload"] or {}).get("event_type"),
+            "title":(row["payload"] or {}).get("title"),
+            "severity":(row["payload"] or {}).get("severity"),
+            "object_id":(row["payload"] or {}).get("object_id"),
+            "status":row["status"],
+            "attempts":row["attempts"],
+            "last_attempt_at":row["last_attempt_at"].isoformat() if row["last_attempt_at"] else None,
+            "next_attempt_at":row["next_attempt_at"].isoformat() if row["next_attempt_at"] else None,
+            "delivered_at":row["delivered_at"].isoformat() if row["delivered_at"] else None,
+            "last_error":row["last_error"],
+            "sentinel_alert_id":row["sentinel_alert_id"],
+            "sentinel_incident_id":row["sentinel_incident_id"],
+            "created_at":row["created_at"].isoformat() if row["created_at"] else None,
+        } for row in rows],
+    }
+
+@app.post("/vault/sentinel/outbox/retry")
+def retry_sentinel_outbox(p: Principal = Depends(require_principal)):
+    _require_military_admin_fresh_mfa(p,"SENTINEL outbox retry")
+    delivered=_flush_sentinel_outbox(100)
+    return {"retried":True,"delivered_now":delivered}
+
 @app.get("/vault/military/summary")
 def military_summary(p: Principal = Depends(require_principal)):
     with connect() as conn:
@@ -1431,21 +1472,81 @@ def _verify_scif_device_proof(cur, request: Request, row) -> None:
         _security_raise(cur, 403, "SCIF cryptographic device proof failed")
 
 
-def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str = "", session_id: str | None = None, object_id: str | None = None, owner: str | None = None) -> bool:
+def _deliver_sentinel_outbox_event(event_id: str) -> bool:
     if not SENTINEL_BASE_URL or not SENTINEL_INGEST_SECRET:
         return False
-    payload = {
-        "source": "UNG-VAULT",
-        "severity": severity,
-        "title": title,
-        "details": details,
-        "event_type": event_type,
-        "session_id": session_id,
-        "object_id": object_id,
-        "owner": owner,
-        "sent_at": utcnow().isoformat(),
-        "nonce": secrets.token_urlsafe(24),
-    }
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT event_id,payload,status,attempts
+                           FROM sentinel_outbox
+                           WHERE event_id=%s FOR UPDATE""",(event_id,))
+            row=cur.fetchone()
+            if not row:
+                return False
+            if row["status"]=="delivered":
+                return True
+            payload=dict(row["payload"])
+    payload["sent_at"]=utcnow().isoformat()
+    payload["nonce"]=secrets.token_urlsafe(24)
+    raw=json.dumps(payload,sort_keys=True,separators=(",",":")).encode("utf-8")
+    signature=hmac.new(SENTINEL_INGEST_SECRET.encode("utf-8"),raw,hashlib.sha256).hexdigest()
+    req=urllib.request.Request(
+        SENTINEL_BASE_URL+"/v1/ingest/vault",
+        data=raw,
+        headers={"Content-Type":"application/json","X-UNG-VAULT-Signature":signature},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req,timeout=3) as resp:
+            body=json.loads(resp.read().decode("utf-8") or "{}")
+            ok=200 <= resp.status < 300
+        if ok:
+            alert_id=str(body.get("id") or body.get("alert_id") or "") or None
+            incident=body.get("incident")
+            incident_id=str((incident or {}).get("id") or "") or None if isinstance(incident,dict) else None
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""UPDATE sentinel_outbox
+                                   SET status='delivered',attempts=attempts+1,last_attempt_at=now(),
+                                       delivered_at=now(),last_error=NULL,
+                                       sentinel_alert_id=%s,sentinel_incident_id=%s
+                                   WHERE event_id=%s""",(alert_id,incident_id,event_id))
+            return True
+    except Exception as exc:
+        err=(type(exc).__name__+": "+str(exc))[:500]
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE sentinel_outbox
+                           SET status='retrying',attempts=attempts+1,last_attempt_at=now(),
+                               next_attempt_at=now() + LEAST(interval '30 seconds' * GREATEST(attempts+1,1), interval '15 minutes'),
+                               last_error=%s
+                           WHERE event_id=%s""",(err,event_id))
+    return False
+
+def _flush_sentinel_outbox(limit: int = 25) -> int:
+    if not SENTINEL_BASE_URL or not SENTINEL_INGEST_SECRET:
+        return 0
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT event_id FROM sentinel_outbox
+                           WHERE status IN ('pending','retrying') AND next_attempt_at<=now()
+                           ORDER BY created_at ASC LIMIT %s""",(max(1,min(100,int(limit))),))
+            event_ids=[str(r["event_id"]) for r in cur.fetchall()]
+    delivered=0
+    for eid in event_ids:
+        if _deliver_sentinel_outbox_event(eid):
+            delivered+=1
+    return delivered
+
+def _sentinel_outbox_worker() -> None:
+    while True:
+        try:
+            _flush_sentinel_outbox()
+        except Exception:
+            pass
+        time.sleep(SENTINEL_OUTBOX_POLL_SECONDS)
+
+def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str = "", session_id: str | None = None, object_id: str | None = None, owner: str | None = None) -> bool:
     stable_basis="|".join([
         event_type or "",
         object_id or "",
@@ -1454,23 +1555,27 @@ def _notify_sentinel(*, severity: str, title: str, event_type: str, details: str
         title or "",
         details or "",
     ]).encode("utf-8")
-    payload["event_id"]="vault-"+hashlib.sha256(stable_basis).hexdigest()[:40]
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    signature = hmac.new(SENTINEL_INGEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-    req = urllib.request.Request(
-        SENTINEL_BASE_URL + "/v1/ingest/vault",
-        data=raw,
-        headers={
-            "Content-Type": "application/json",
-            "X-UNG-VAULT-Signature": signature,
-        },
-        method="POST",
-    )
+    event_id="vault-"+hashlib.sha256(stable_basis).hexdigest()[:40]
+    payload={
+        "source":"UNG-VAULT",
+        "severity":severity,
+        "title":title,
+        "details":details,
+        "event_type":event_type,
+        "session_id":session_id,
+        "object_id":object_id,
+        "owner":owner,
+        "event_id":event_id,
+    }
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            return 200 <= resp.status < 300
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO sentinel_outbox(event_id,payload,status,next_attempt_at)
+                               VALUES(%s,%s::jsonb,'pending',now())
+                               ON CONFLICT (event_id) DO NOTHING""",(event_id,json.dumps(payload)))
     except Exception:
         return False
+    return _deliver_sentinel_outbox_event(event_id)
 
 
 def _sentinel_signed_probe() -> bool:
