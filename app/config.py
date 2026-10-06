@@ -28,6 +28,13 @@ def _optional_master_key() -> bytes | None:
     return master_key
 
 
+def _is_production(environment: str) -> bool:
+    values = {environment}
+    for var in ("ENV", "RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME"):
+        values.add(os.getenv(var, "").strip().lower())
+    return bool(values & {"production", "prod"})
+
+
 def load_settings() -> Settings:
     database_url = os.getenv("DATABASE_URL", "").strip()
     janus_introspect_url = os.getenv("JANUS_INTROSPECT_URL", "").strip()
@@ -44,8 +51,9 @@ def load_settings() -> Settings:
         raise RuntimeError(f"Unsupported VAULT_KEY_BACKEND: {key_backend}")
     if key_backend == "local" and master_key is None:
         raise RuntimeError("VAULT_MASTER_KEY_B64 is required for local key backend")
-    if environment == "production" and key_backend == "local":
-        raise RuntimeError("production requires a managed key backend")
+    if _is_production(environment) and key_backend == "local":
+        if os.getenv("VAULT_ALLOW_LOCAL_KEY_BACKEND_IN_PRODUCTION", "").strip().lower() not in {"1", "true", "yes"}:
+            raise RuntimeError("production requires a managed key backend")
 
     return Settings(
         database_url=database_url,
